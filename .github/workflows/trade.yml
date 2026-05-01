@@ -1,0 +1,66 @@
+# .github/workflows/trade.yml
+# Runs the algo trading script every trading day at 9:15 AM IST (3:45 AM UTC)
+# On the 1st of each month it also recalculates monthly levels.
+# On 1st Jan it recalculates yearly levels.
+# All credentials are stored in GitHub Secrets — never in code.
+
+name: Daily Algo Trade Run
+
+on:
+  schedule:
+    # 3:45 AM UTC = 9:15 AM IST (Mon–Fri only)
+    - cron: "45 3 * * 1-5"
+
+  # Also allows manual trigger from GitHub Actions UI (for testing)
+  workflow_dispatch:
+
+jobs:
+  run-algo:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run trading algo
+        env:
+          # ── Broker selection ────────────────────────────────────────────────
+          BROKER: ${{ secrets.BROKER }}  # "angel" or "zerodha"
+
+          # ── Angel One ───────────────────────────────────────────────────────
+          ANGEL_API_KEY:   ${{ secrets.ANGEL_API_KEY }}
+          ANGEL_CLIENT_ID: ${{ secrets.ANGEL_CLIENT_ID }}
+          ANGEL_PASSWORD:  ${{ secrets.ANGEL_PASSWORD }}
+          ANGEL_TOTP_KEY:  ${{ secrets.ANGEL_TOTP_KEY }}
+
+          # ── Zerodha ─────────────────────────────────────────────────────────
+          ZERODHA_API_KEY:      ${{ secrets.ZERODHA_API_KEY }}
+          ZERODHA_API_SECRET:   ${{ secrets.ZERODHA_API_SECRET }}
+          ZERODHA_ACCESS_TOKEN: ${{ secrets.ZERODHA_ACCESS_TOKEN }}
+
+          # ── Google Sheets ───────────────────────────────────────────────────
+          GOOGLE_CREDENTIALS_JSON: ${{ secrets.GOOGLE_CREDENTIALS_JSON }}
+          SPREADSHEET_ID:          ${{ secrets.SPREADSHEET_ID }}
+
+          # ── Telegram ────────────────────────────────────────────────────────
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID:   ${{ secrets.TELEGRAM_CHAT_ID }}
+
+        run: python main.py
+
+      - name: Upload run log on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: algo-run-log
+          path: "*.log"
+          retention-days: 7
