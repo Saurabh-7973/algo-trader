@@ -1,13 +1,13 @@
 """
 data_fetcher.py — Fetches OHLC data from NSE via yfinance (100% free).
 
-Timeframe mapping (from API doc):
-  - "daily"   → Previous Day HLC   (for 15-min / intraday trading)
-  - "monthly" → Previous Month HLC (for 2–3 day trading)
-  - "yearly"  → Previous Year HLC  (for swing trading)
+Fixes applied v2:
+  - _ticker() strips .NS before re-adding — prevents RELIANCE.NS.NS double suffix
+  - interval=1y removed (yfinance dropped support); yearly uses 1mo resample
+  - rounding applied to all OHLC values
 """
 
-from datetime import datetime, date
+from datetime import date
 import yfinance as yf
 import pandas as pd
 from levels import OHLC
@@ -17,39 +17,40 @@ logger = logging.getLogger(__name__)
 
 
 def _ticker(symbol: str) -> str:
-    """Convert plain symbol to NSE yfinance format. e.g. RELIANCE → RELIANCE.NS"""
-    return symbol.upper() + ".NS" if not symbol.endswith(".NS") else symbol.upper()
+    """
+    Always strip .NS first, then re-add.
+    Handles both 'RELIANCE' and 'RELIANCE.NS' inputs safely.
+    """
+    return symbol.upper().replace(".NS", "").strip() + ".NS"
 
 
 def get_previous_day_ohlc(symbol: str) -> OHLC | None:
-    """
-    Fetch previous trading day's High, Low, Close.
-    Used for daily (intraday) level calculation.
-    """
+    """Previous trading day HLC — used for daily intraday levels."""
     try:
         df = yf.Ticker(_ticker(symbol)).history(period="5d", interval="1d")
-        if df.empty or len(df) < 2:
+        if df is None or df.empty or len(df) < 2:
             logger.warning(f"{symbol}: not enough daily data")
             return None
-        row = df.iloc[-2]  # -1 is today (may be incomplete), -2 is last complete day
-        return OHLC(high=row["High"], low=row["Low"], close=row["Close"])
+        row = df.iloc[-2]
+        return OHLC(high=round(float(row["High"]), 2),
+                    low=round(float(row["Low"]), 2),
+                    close=round(float(row["Close"]), 2))
     except Exception as e:
         logger.error(f"{symbol} daily fetch error: {e}")
         return None
 
 
 def get_previous_month_ohlc(symbol: str) -> OHLC | None:
-    """
-    Fetch previous calendar month's High, Low, Close.
-    Used for Daily Timeframe level calculation (recalculated on 1st of each month).
-    """
+    """Previous calendar month HLC — used for daily timeframe levels."""
     try:
         df = yf.Ticker(_ticker(symbol)).history(period="3mo", interval="1mo")
-        if df.empty or len(df) < 2:
+        if df is None or df.empty or len(df) < 2:
             logger.warning(f"{symbol}: not enough monthly data")
             return None
-        row = df.iloc[-2]  # last completed month
-        return OHLC(high=row["High"], low=row["Low"], close=row["Close"])
+        row = df.iloc[-2]
+        return OHLC(high=round(float(row["High"]), 2),
+                    low=round(float(row["Low"]), 2),
+                    close=round(float(row["Close"]), 2))
     except Exception as e:
         logger.error(f"{symbol} monthly fetch error: {e}")
         return None
@@ -57,23 +58,35 @@ def get_previous_month_ohlc(symbol: str) -> OHLC | None:
 
 def get_previous_year_ohlc(symbol: str) -> OHLC | None:
     """
-    Fetch previous calendar year's High, Low, Close.
-    Used for Weekly/Monthly Timeframe levels (recalculated on 1st Jan).
+    Previous calendar year HLC — used for weekly/monthly timeframe levels.
+    yfinance no longer supports interval=1y, so we fetch 2y of monthly data
+    and resample to annual ourselves.
     """
     try:
-        df = yf.Ticker(_ticker(symbol)).history(period="5y", interval="1y")
-        if df.empty or len(df) < 2:
-            logger.warning(f"{symbol}: not enough yearly data")
+        df = yf.Ticker(_ticker(symbol)).history(period="2y", interval="1mo")
+        if df is None or df.empty or len(df) < 13:
+            logger.warning(f"{symbol}: not enough data for yearly OHLC")
             return None
-        row = df.iloc[-2]  # last completed year
-        return OHLC(high=row["High"], low=row["Low"], close=row["Close"])
+        df.index = pd.to_datetime(df.index)
+        annual = df.resample("YE").agg({
+            "High":  "max",
+            "Low":   "min",
+            "Close": "last",
+        }).dropna()
+        if len(annual) < 2:
+            logger.warning(f"{symbol}: not enough yearly rows after resample")
+            return None
+        row = annual.iloc[-2]
+        return OHLC(high=round(float(row["High"]), 2),
+                    low=round(float(row["Low"]), 2),
+                    close=round(float(row["Close"]), 2))
     except Exception as e:
         logger.error(f"{symbol} yearly fetch error: {e}")
         return None
 
 
 def get_all_ohlc(symbol: str) -> dict[str, OHLC | None]:
-    """Fetch all three timeframes in one call. Returns dict with keys: daily, monthly, yearly."""
+    """Fetch daily, monthly, yearly OHLC in one call."""
     return {
         "daily":   get_previous_day_ohlc(symbol),
         "monthly": get_previous_month_ohlc(symbol),
