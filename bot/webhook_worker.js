@@ -179,17 +179,34 @@ async function send(env, chatId, text) {
 
 async function triggerScan(env, requestingChatId) {
   const [owner, repo] = (env.GITHUB_REPO || "").split("/");
-  await fetch(`https://api.github.com/repos/${owner}/${repo}/dispatches`, {
-    method: "POST",
-    headers: {
-      "Authorization": `Bearer ${env.GITHUB_TOKEN}`,
-      "Accept": "application/vnd.github+json",
-      "Content-Type": "application/json",
-      "X-GitHub-Api-Version": "2022-11-28",
-    },
-    body: JSON.stringify({
-      event_type: "scan",
-      client_payload: { requesting_chat_id: requestingChatId },
-    }),
-  });
+  const url = `https://api.github.com/repos/${owner}/${repo}/dispatches`;
+
+  try {
+    const response = await fetch(url, {
+      method: "POST",
+      headers: {
+        "Authorization": `Bearer ${env.GITHUB_TOKEN}`,
+        "Accept": "application/vnd.github+json",
+        "Content-Type": "application/json",
+        "X-GitHub-Api-Version": "2022-11-28",
+      },
+      body: JSON.stringify({
+        event_type: "scan",
+        client_payload: { requesting_chat_id: requestingChatId },
+      }),
+    });
+
+    if (!response.ok) {
+      const errorText = await response.text();
+      console.error(`GitHub dispatch failed: ${response.status} - ${errorText}`);
+      await send(env, requestingChatId,
+        `❌ Scan could not be started.\nGitHub returned: ${response.status}\nCheck logs for details.`
+      );
+    }
+  } catch (error) {
+    console.error(`GitHub dispatch error: ${error}`);
+    await send(env, requestingChatId,
+      `❌ Scan failed to trigger.\nError: ${error.message}`
+    );
+  }
 }
