@@ -2,6 +2,7 @@
 # Runs the algo trading script every trading day at 9:15 AM IST (3:45 AM UTC)
 # On the 1st of each month it also recalculates monthly levels.
 # On 1st Jan it recalculates yearly levels.
+# Also supports on-demand scans via /scan Telegram command (repository_dispatch).
 # All credentials are stored in GitHub Secrets — never in code.
 
 name: Daily Algo Trade Run
@@ -11,8 +12,12 @@ on:
     # 3:45 AM UTC = 9:15 AM IST (Mon–Fri only)
     - cron: "45 3 * * 1-5"
 
-  # Also allows manual trigger from GitHub Actions UI (for testing)
+  # Manual trigger from GitHub Actions UI (for testing)
   workflow_dispatch:
+
+  # Triggered by Cloudflare Worker when user sends /scan on Telegram
+  repository_dispatch:
+    types: [scan]
 
 jobs:
   run-algo:
@@ -55,6 +60,9 @@ jobs:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID:   ${{ secrets.TELEGRAM_CHAT_ID }}
           TELEGRAM_CHAT_IDS:  ${{ secrets.TELEGRAM_CHAT_IDS }}
+
+          # ── On-demand scan ────────────────────────────────────────────────
+          REQUESTING_CHAT_ID: ${{ github.event.client_payload.requesting_chat_id }}
 
         run: python main.py
 
