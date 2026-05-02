@@ -15,7 +15,7 @@ from datetime import datetime
 import yfinance as yf
 
 import os
-from config import TELEGRAM_BOT_TOKEN, BROKER
+from config import TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, BROKER
 from data_fetcher import fetch_all_ohlc_batch, get_all_ohlc, is_first_day_of_month, is_first_day_of_year
 from levels import calculate_levels, levels_to_dict, OHLC
 from sheets_manager import (get_stock_basket, write_levels, append_signals_batch,
