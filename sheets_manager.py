@@ -40,7 +40,8 @@ def get_stock_basket() -> list[str]:
     symbols = [
         r["Symbol"].strip().upper()
         for r in records
-        if str(r.get("Active", "")).strip().upper() == "YES"
+        if str(r.get("Active", "")).strip().upper() in ("YES", "TRUE", "Y", "1")
+        and r.get("Symbol", "").strip() != ""   # skip blank rows
     ]
     logger.info(f"Loaded {len(symbols)} active stocks from basket: {symbols}")
     return symbols

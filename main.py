@@ -67,7 +67,9 @@ def run():
     # 1. Load stock basket
     symbols = get_stock_basket()
     if not symbols:
-        logger.warning("No active stocks in basket. Exiting.")
+        msg = "No active stocks found in basket. Add stocks to the Basket tab with Active=YES."
+        logger.warning(msg)
+        send_telegram(f"⚠️ Algo Trader: {msg}", TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID)
         return
 
     logger.info(f"Processing {len(symbols)} stocks...")

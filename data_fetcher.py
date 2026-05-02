@@ -8,6 +8,7 @@ Fixes applied v2:
 """
 
 from datetime import date
+import time
 import yfinance as yf
 import pandas as pd
 from levels import OHLC
@@ -24,10 +25,27 @@ def _ticker(symbol: str) -> str:
     return symbol.upper().replace(".NS", "").strip() + ".NS"
 
 
+def _fetch_with_retry(symbol: str, period: str, interval: str, retries: int = 3) -> any:
+    """Fetch yfinance data with retry on rate limit. Adds 1s delay between each call."""
+    time.sleep(0.5)   # base delay — 50 stocks × 0.5s = 25s total, well within rate limits
+    for attempt in range(retries):
+        try:
+            df = yf.Ticker(_ticker(symbol)).history(period=period, interval=interval)
+            return df
+        except Exception as e:
+            if "Too Many Requests" in str(e) or "Rate limited" in str(e):
+                wait = (attempt + 1) * 5
+                logger.warning(f"{symbol}: rate limited, waiting {wait}s (attempt {attempt+1}/{retries})")
+                time.sleep(wait)
+            else:
+                raise e
+    return None
+
+
 def get_previous_day_ohlc(symbol: str) -> OHLC | None:
     """Previous trading day HLC — used for daily intraday levels."""
     try:
-        df = yf.Ticker(_ticker(symbol)).history(period="5d", interval="1d")
+        df = _fetch_with_retry(symbol, "5d", "1d")
         if df is None or df.empty or len(df) < 2:
             logger.warning(f"{symbol}: not enough daily data")
             return None
@@ -43,7 +61,7 @@ def get_previous_day_ohlc(symbol: str) -> OHLC | None:
 def get_previous_month_ohlc(symbol: str) -> OHLC | None:
     """Previous calendar month HLC — used for daily timeframe levels."""
     try:
-        df = yf.Ticker(_ticker(symbol)).history(period="3mo", interval="1mo")
+        df = _fetch_with_retry(symbol, "3mo", "1mo")
         if df is None or df.empty or len(df) < 2:
             logger.warning(f"{symbol}: not enough monthly data")
             return None
@@ -63,7 +81,7 @@ def get_previous_year_ohlc(symbol: str) -> OHLC | None:
     and resample to annual ourselves.
     """
     try:
-        df = yf.Ticker(_ticker(symbol)).history(period="2y", interval="1mo")
+        df = _fetch_with_retry(symbol, "2y", "1mo")
         if df is None or df.empty or len(df) < 13:
             logger.warning(f"{symbol}: not enough data for yearly OHLC")
             return None
