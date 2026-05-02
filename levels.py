@@ -85,8 +85,11 @@ def calculate_levels(symbol: str, current: OHLC, timeframe: str,
     range_width  = pivot_top - pivot_bottom
 
     # ── Narrow Range Definition (NRD) ─────────────────────────────────────────
-    # Signal: Range Width < 0.4% of Closing Price (use abs for edge cases)
-    is_nrd = abs(range_width) < (NRD_THRESHOLD * C)
+    # TWO conditions must BOTH be true (Neelam's validation):
+    # 1. Range Width must be POSITIVE: close above session midpoint (bullish compression)
+    #    Negative range_width = close in lower half of candle = weak close = NOT a valid NRD
+    # 2. Range Width must be < 0.4% of Close (tight, compressed range)
+    is_nrd = (range_width > 0) and (range_width < (NRD_THRESHOLD * C))
 
     # ── Insider Trading Level condition ───────────────────────────────────────
     # Requires previous period's levels for comparison
