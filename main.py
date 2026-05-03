@@ -1,36 +1,36 @@
 """
-main.py — Daily algo trading orchestrator (Nifty 500 scale).
+main.py — Daily algo trading orchestrator (v7)
 
 Pipeline:
-  1. Optionally auto-refresh basket from Nifty 500 feed (if Settings tab allows)
-  2. Load stock basket from Google Sheets
-  3. Batch-fetch ALL OHLC data in one pass (15 API calls for 500 stocks)
-  4. Calculate levels + signals for every stock/timeframe
-  5. Batch-write to Google Sheets
-  6. Telegram alerts + GTT orders for signals
+  1. Load stock basket from Google Sheets
+  2. Fetch HLC for ALL three timeframes (daily, monthly, yearly)
+  3. Calculate levels + signals for each timeframe independently
+  4. Write levels to Sheets (all timeframes)
+  5. On 1st of month  → also refresh stored Monthly levels
+  6. On 1st of Jan    → also refresh stored Yearly levels
+  7. Broadcast consolidated signal alert via Telegram
 """
 
 import logging
-import sys
 import os
-import time
-import io
-import csv
-import requests
+import sys
 from datetime import datetime
-import yfinance as yf
 
-from config import TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID, BROKER
-from data_fetcher import fetch_all_ohlc_batch, get_all_ohlc, is_first_day_of_month, is_first_day_of_year
-from levels import calculate_levels, levels_to_dict, OHLC
-from sheets_manager import (get_stock_basket, write_levels, append_signals_batch,
-                            write_stored_levels)
-from alerts import send_telegram, broadcast, get_active_chat_ids, format_signal_message, format_daily_summary
+from config import BROKER, TELEGRAM_BOT_TOKEN
+from data_fetcher import fetch_all_timeframes
+from levels import TradingLevels
+from sheets_manager import (
+    get_stock_basket,
+    write_levels,
+    append_signals_batch,
+    write_stored_levels,
+    get_stored_levels,
+    get_client,
+)
+from alerts import broadcast
 from broker import place_gtt_orders
 
-# On-demand scan: if triggered by /scan command, results go to requesting user
-REQUESTING_CHAT_ID = os.getenv("REQUESTING_CHAT_ID", "").strip()
-
+# ─── Logging ──────────────────────────────────────────────────────────────────
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
@@ -38,237 +38,169 @@ logging.basicConfig(
 )
 logger = logging.getLogger("main")
 
+REQUESTING_CHAT_ID = os.getenv("REQUESTING_CHAT_ID", "")
 
-# ---------------------------------------------------------------------------
-#  NEW: Auto-basket toggle and refresh functions
-# ---------------------------------------------------------------------------
 
-def _read_auto_basket_setting() -> bool:
+def compute_levels_for_timeframe(
+    symbols: list[str],
+    hlc_data: dict[str, dict],
+    timeframe_label: str,
+) -> tuple[list[dict], list[dict]]:
     """
-    Reads the AUTO_BASKET flag from the Settings tab.
-    Returns True if AUTO_BASKET is exactly 'TRUE' (case-insensitive),
-    otherwise False (including missing tab/cell).
+    Given a dict of {symbol: {High, Low, Close}}, compute levels + signals.
+
+    Returns:
+        levels_rows  — list of dicts for Sheets write
+        signal_rows  — list of dicts for stocks where NRD + Insider both true
     """
-    try:
-        from sheets_manager import _get_client, SPREADSHEET_ID
-        client = _get_client()
-        ws = client.open_by_key(SPREADSHEET_ID).worksheet("Settings")
-        # Get cell B2 (row 2, col 2)
-        value = ws.acell("B2").value
-        return value is not None and value.strip().upper() == "TRUE"
-    except Exception as e:
-        logger.warning(f"Could not read Settings tab: {e}. Defaulting to manual basket.")
-        return False
+    levels_rows = []
+    signal_rows = []
+    calc = TradingLevels()
 
-
-def refresh_nifty500_basket() -> bool:
-    """
-    Fetches latest Nifty 500 constituents from NSE, validates via yfinance,
-    and overwrites the Basket sheet with all valid symbols set to Active=YES.
-    Returns True on success, False if it fails or skips.
-    """
-    from sheets_manager import _get_client, SPREADSHEET_ID, BASKET_SHEET
-    import yfinance as yf
-    import pandas as pd
-
-    URL = "https://archives.nseindia.com/content/indices/ind_nifty500list.csv"
-
-    # --- Step 1: Download CSV ---
-    try:
-        response = requests.get(URL, timeout=15)
-        response.raise_for_status()
-    except Exception as e:
-        logger.warning(f"Could not fetch Nifty 500 CSV: {e}. Skipping basket refresh.")
-        return False
-
-    # --- Step 2: Parse CSV ---
-    reader = csv.DictReader(io.StringIO(response.text))
-    symbols_raw = [
-        row["Symbol"].strip()
-        for row in reader
-        if row.get("Symbol") and row["Symbol"].strip()
-    ]
-    if not symbols_raw:
-        logger.warning("No symbols found in Nifty 500 CSV. Skipping refresh.")
-        return False
-
-    logger.info(f"Fetched {len(symbols_raw)} raw symbols from NSE.")
-
-    # --- Step 3: Validate with yfinance (batch) ---
-    tickers = [f"{s}.NS" for s in symbols_raw]
-    valid = []
-
-    batch_size = 100
-    for i in range(0, len(tickers), batch_size):
-        batch = tickers[i:i+batch_size]
-        try:
-            df = yf.download(
-                batch, period="1d", interval="1d",
-                group_by="ticker", auto_adjust=True,
-                progress=False, threads=True, timeout=15
-            )
-        except Exception:
+    for symbol in symbols:
+        hlc = hlc_data.get(symbol)
+        if not hlc:
+            logger.warning(f"  {symbol}/{timeframe_label}: HLC unavailable, skipping.")
             continue
 
-        # Check which symbols returned data
-        for t in batch:
-            try:
-                if isinstance(df.columns, pd.MultiIndex):
-                    if t in df.columns.get_level_values(0):
-                        series = df[t]
-                        if not series.dropna().empty:
-                            valid.append(t)
-                else:
-                    # Single stock edge case
-                    if not df.empty:
-                        valid.append(t)
-            except Exception:
-                pass
+        try:
+            result = calc.calculate(
+                high=hlc["High"],
+                low=hlc["Low"],
+                close=hlc["Close"],
+            )
+        except Exception as e:
+            logger.error(f"  {symbol}/{timeframe_label}: calculation error — {e}")
+            continue
 
-        time.sleep(0.5)   # gentle pacing
+        row = {
+            "Symbol":    symbol,
+            "Timeframe": timeframe_label,
+            "Date":      hlc.get("Date", ""),
+            "High":      hlc["High"],
+            "Low":       hlc["Low"],
+            "Close":     hlc["Close"],
+            **{k: round(v, 2) if isinstance(v, float) else v for k, v in result.items()},
+        }
+        levels_rows.append(row)
 
-    if not valid:
-        logger.warning("All fetched symbols failed validation. Skipping refresh.")
-        return False
+        if result.get("Signal"):
+            signal_rows.append(row)
+            logger.info(
+                f"  ✅ SIGNAL {symbol} [{timeframe_label}] "
+                f"H6={result.get('H6')} L6={result.get('L6')}"
+            )
 
-    logger.info(f"Validated {len(valid)} symbols – updating Basket sheet.")
+    return levels_rows, signal_rows
 
-    # --- Step 4: Overwrite Basket sheet ---
-    client = _get_client()
-    ws = client.open_by_key(SPREADSHEET_ID).worksheet(BASKET_SHEET)
-    ws.clear()
-
-    # Header
-    ws.append_row(["Symbol", "Active", "Notes"])
-    # All valid stocks, Active=YES
-    rows = [[s, "YES", ""] for s in sorted(valid)]
-    ws.append_rows(rows, value_input_option="USER_ENTERED")
-
-    logger.info("Basket refreshed with latest Nifty 500 constituents.")
-    return True
-
-
-# ---------------------------------------------------------------------------
-#  Existing helper
-# ---------------------------------------------------------------------------
-
-def get_prev_day_for_insider(symbol: str) -> OHLC | None:
-    """Fetch day-before-yesterday for insider condition comparison (daily TF only)."""
-    try:
-        from data_fetcher import _ticker
-        df = yf.Ticker(_ticker(symbol)).history(period="5d", interval="1d")
-        if df is None or len(df) < 3:
-            return None
-        row = df.iloc[-3]
-        return OHLC(
-            high=round(float(row["High"]), 2),
-            low=round(float(row["Low"]), 2),
-            close=round(float(row["Close"]), 2),
-        )
-    except Exception:
-        return None
-
-
-# ---------------------------------------------------------------------------
-#  Main pipeline
-# ---------------------------------------------------------------------------
 
 def run():
+    now = datetime.now()
     logger.info("=" * 60)
-    logger.info(f"Algo run started — {datetime.now().strftime('%Y-%m-%d %H:%M IST')}")
+    logger.info(f"Algo run started — {now.strftime('%Y-%m-%d %H:%M')} IST")
     logger.info(f"Broker: {BROKER.upper()}")
     logger.info("=" * 60)
 
-    # ── NEW: Auto-refresh basket if Settings tab says so ──────────────────
-    if _read_auto_basket_setting():
-        logger.info("AUTO_BASKET=TRUE – refreshing basket from Nifty 500 feed...")
-        success = refresh_nifty500_basket()
-        if not success:
-            logger.warning("Auto-refresh basket failed. Falling back to current basket.")
-    else:
-        logger.info("AUTO_BASKET=FALSE – using manual basket as-is.")
-    # ────────────────────────────────────────────────────────────────────
-
-    # 1. Load basket (now possibly updated)
+    # ── 1. Load basket ────────────────────────────────────────────────────────
     symbols = get_stock_basket()
     if not symbols:
-        msg = "No active stocks in basket. Add stocks to Basket tab with Active=YES."
+        msg = "⚠️ Basket is empty — no active stocks found. Add stocks to Basket tab."
         logger.warning(msg)
-        send_telegram(f"⚠️ Algo Trader: {msg}", TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID)
+        if TELEGRAM_BOT_TOKEN:
+            broadcast(msg, requesting_chat_id=REQUESTING_CHAT_ID)
         return
 
-    logger.info(f"Basket loaded: {len(symbols)} stocks")
+    logger.info(f"Basket: {len(symbols)} active stocks")
 
-    # 2. Batch fetch ALL OHLC (one pass — 15 API calls for 500 stocks)
-    logger.info("Starting batch OHLC fetch...")
-    all_ohlc = fetch_all_ohlc_batch(symbols)
+    # ── 2. Fetch all HLC data ─────────────────────────────────────────────────
+    logger.info("Fetching HLC for all timeframes …")
+    all_hlc = fetch_all_timeframes(symbols)
+    daily_hlc   = all_hlc["daily"]
+    monthly_hlc = all_hlc["monthly"]
+    yearly_hlc  = all_hlc["yearly"]
 
-    # 3. Calculate levels + signals
-    all_levels_rows = []
-    signal_rows     = []
-    all_results     = []
-    monthly_store   = []
-    yearly_store    = []
+    logger.info(
+        f"Data fetched — daily: {len(daily_hlc)}, "
+        f"monthly: {len(monthly_hlc)}, yearly: {len(yearly_hlc)} stocks"
+    )
 
-    first_of_month = is_first_day_of_month()
-    first_of_year  = is_first_day_of_year()
+    # ── 3. Calculate levels for each timeframe ────────────────────────────────
+    logger.info("Calculating daily levels …")
+    daily_levels, daily_signals = compute_levels_for_timeframe(
+        symbols, daily_hlc, "Daily"
+    )
 
-    for symbol in symbols:
-        ohlc = all_ohlc.get(symbol, {"daily": None, "monthly": None, "yearly": None})
-        previous_day = get_prev_day_for_insider(symbol)
+    logger.info("Calculating monthly levels …")
+    monthly_levels, monthly_signals = compute_levels_for_timeframe(
+        symbols, monthly_hlc, "Monthly"
+    )
 
-        for timeframe, data in ohlc.items():
-            if data is None:
-                logger.warning(f"  {symbol}/{timeframe}: data unavailable, skipping.")
-                continue
+    logger.info("Calculating yearly levels …")
+    yearly_levels, yearly_signals = compute_levels_for_timeframe(
+        symbols, yearly_hlc, "Yearly"
+    )
 
-            prev = previous_day if timeframe == "daily" else None
-            lv   = calculate_levels(symbol, data, timeframe, previous=prev)
-            row_dict = levels_to_dict(lv)
-            all_levels_rows.append(row_dict)
-            all_results.append(lv)
+    all_levels  = daily_levels  + monthly_levels  + yearly_levels
+    all_signals = daily_signals + monthly_signals + yearly_signals
 
-            stored = {"Symbol": symbol, "H5": lv.H5, "H6": lv.H6,
-                      "L5": lv.L5, "L6": lv.L6}
-            if timeframe == "monthly" and first_of_month:
-                monthly_store.append(stored)
-            if timeframe == "yearly" and first_of_year:
-                yearly_store.append(stored)
+    logger.info(
+        f"Signals — daily: {len(daily_signals)}, "
+        f"monthly: {len(monthly_signals)}, yearly: {len(yearly_signals)}"
+    )
 
-            if lv.signal:
-                logger.info(f"  SIGNAL: {symbol} [{timeframe}] BUY@{lv.H6} SELL@{lv.L6}")
-                signal_rows.append(row_dict)
-                send_telegram(format_signal_message(lv), TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID)
-                place_gtt_orders(symbol, lv.H6, lv.L6, qty=1)
+    # ── 4. Write levels to Sheets ─────────────────────────────────────────────
+    if all_levels:
+        write_levels(all_levels)
 
-    # 4. Write to Sheets (all batched)
-    logger.info(f"Writing {len(all_levels_rows)} level rows to Sheets...")
-    write_levels(all_levels_rows)
+    if all_signals:
+        append_signals_batch(all_signals)
 
-    if signal_rows:
-        append_signals_batch(signal_rows)
+    # ── 5. Refresh stored Monthly levels on 1st of every month ───────────────
+    if now.day == 1 and monthly_levels:
+        logger.info("1st of month — refreshing stored Monthly levels tab …")
+        stored_monthly = [
+            {"Symbol": r["Symbol"], "H5": r.get("H5"), "H6": r.get("H6"),
+             "L5": r.get("L5"), "L6": r.get("L6")}
+            for r in monthly_levels
+        ]
+        write_stored_levels("Monthly", stored_monthly)
 
-    if first_of_month and monthly_store:
-        write_stored_levels("Monthly", monthly_store)
+    # ── 6. Refresh stored Yearly levels on 1st of January ────────────────────
+    if now.month == 1 and now.day == 1 and yearly_levels:
+        logger.info("1st Jan — refreshing stored Yearly levels tab …")
+        stored_yearly = [
+            {"Symbol": r["Symbol"], "H5": r.get("H5"), "H6": r.get("H6"),
+             "L5": r.get("L5"), "L6": r.get("L6")}
+            for r in yearly_levels
+        ]
+        write_stored_levels("Yearly", stored_yearly)
 
-    if first_of_year and yearly_store:
-        write_stored_levels("Yearly", yearly_store)
+    # ── 7. Place GTT orders for all signals ───────────────────────────────────
+    if BROKER not in ("", "paper"):
+        for sig in all_signals:
+            symbol = sig["Symbol"]
+            h6 = sig.get("H6")
+            l6 = sig.get("L6")
+            if h6 and l6:
+                try:
+                    result = place_gtt_orders(symbol=symbol, h6=h6, l6=l6, qty=1)
+                    logger.info(f"GTT order result for {symbol}: {result}")
+                except Exception as e:
+                    logger.error(f"GTT order failed for {symbol}: {e}")
+    else:
+        logger.info(f"Broker=PAPER — GTT orders skipped (dry run)")
 
-    # 5. Daily summary — get active users from Sheets Users tab, broadcast to all
-    import os as _os
-    from sheets_manager import _get_client as _gc
-    try:
-        _sc = _gc()
-        _sid = _os.getenv("SPREADSHEET_ID", "")
-    except Exception:
-        _sc, _sid = None, None
-    active_ids = get_active_chat_ids(_sc, _sid)
-    summary    = format_daily_summary(all_results)
-    broadcast(summary, active_ids)
+    # ── 8. Broadcast Telegram alert ───────────────────────────────────────────
+    broadcast(
+        daily_signals=daily_signals,
+        monthly_signals=monthly_signals,
+        yearly_signals=yearly_signals,
+        run_date=now.strftime("%d %b %Y"),
+        requesting_chat_id=REQUESTING_CHAT_ID,
+    )
 
     logger.info("=" * 60)
-    signals_count = sum(1 for r in all_results if r.signal)
-    logger.info(f"Run complete. {len(symbols)} stocks scanned. {signals_count} signals.")
+    logger.info("Run complete.")
     logger.info("=" * 60)
 
 

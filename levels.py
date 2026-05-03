@@ -1,146 +1,104 @@
 """
-levels.py — Core strategy calculations.
+levels.py — Core strategy calculations (v3 NRD fix retained).
 
-Implements all formulas from the Trading Strategy document:
-  - H3, H4, H5, H6 (resistance levels)
-  - L3, L4, L5, L6 (support levels)
-  - Pivot Range (Middle, Bottom, Top)
-  - Narrow Range Definition (NRD)
-  - Insider Trading Level condition
-  - Final signal: trade only when BOTH conditions are met
+Formulas from Trading_Strategy.docx / API_Doc.docx:
+  H3 = Close + (High - Low) * 0.275
+  H4 = Close + (High - Low) * 0.55
+  H5 = H4 + 1.168 * (H4 - H3)
+  H6 = (High / Low) * Close
+
+  L3 = Close - (High - Low) * 0.275
+  L4 = Close - (High - Low) * 0.55
+  L5 = L4 - 1.168 * (L3 - L4)
+  L6 = Close - (H6 - Close)
+
+Pivot Range:
+  Middle = (High + Low + Close) / 3
+  Bottom = Middle - (High - Low)
+  Top    = Middle + (High - Low)
+
+NRD (Narrow Range Day):
+  range_width = (2*Close - High - Low) / 3
+  NRD = range_width > 0 AND range_width < 0.4% of Close
+  (Must be positive — negative range_width means bearish close, not a valid NRD)
+
+Insider Trading Level:
+  Today's (H3–L3) range < Yesterday's (H3–L3) range
+  → price is compressing = insider accumulation
+
+Signal = NRD AND Insider both True
 """
 
-from dataclasses import dataclass
-from typing import Optional
-from config import NRD_THRESHOLD
+import logging
+
+logger = logging.getLogger(__name__)
 
 
-@dataclass
-class OHLC:
-    high: float
-    low: float
-    close: float
-
-
-@dataclass
 class TradingLevels:
-    symbol: str
-    timeframe: str       # "daily", "monthly", "yearly"
 
-    # Resistance levels
-    H3: float
-    H4: float
-    H5: float
-    H6: float
+    def calculate(self, high: float, low: float, close: float) -> dict:
+        """
+        Calculate all levels for a single candle.
+        Returns dict with H3-H6, L3-L6, pivot levels, NRD flag,
+        Insider flag (requires prev_high/prev_low), and Signal.
+        """
+        rng = high - low  # candle range
 
-    # Support levels
-    L3: float
-    L4: float
-    L5: float
-    L6: float
+        # ── Resistance levels ──
+        h3 = close + rng * 0.275
+        h4 = close + rng * 0.55
+        h5 = h4 + 1.168 * (h4 - h3)
+        h6 = (high / low) * close if low != 0 else 0.0
 
-    # Pivot Range
-    pivot_middle: float
-    pivot_bottom: float
-    pivot_top: float
-    range_width: float
+        # ── Support levels ──
+        l3 = close - rng * 0.275
+        l4 = close - rng * 0.55
+        l5 = l4 - 1.168 * (l3 - l4)
+        l6 = close - (h6 - close)
 
-    # Conditions
-    is_nrd: bool                       # Narrow Range Day
-    is_insider: bool                   # Insider Trading Level condition
-    signal: bool                       # True = trade signal (both conditions met)
-    signal_type: Optional[str] = None  # "BUY" or "SELL" or "BOTH"
+        # ── Pivot Range ──
+        pivot_mid    = (high + low + close) / 3
+        pivot_bottom = pivot_mid - rng
+        pivot_top    = pivot_mid + rng
 
+        # ── NRD check ──
+        range_width = (2 * close - high - low) / 3
+        nrd = (range_width > 0) and (range_width < 0.004 * close)
 
-def calculate_levels(symbol: str, current: OHLC, timeframe: str,
-                     previous: Optional[OHLC] = None) -> TradingLevels:
-    """
-    Calculate all trading levels for a stock.
+        # ── Insider condition (requires prev candle — injected externally) ──
+        # This flag is set by the caller when it has yesterday's H3/L3.
+        insider = False  # default; set True by caller if prev range > current range
 
-    Args:
-        symbol:    Stock ticker (e.g. "RELIANCE")
-        current:   Today's OHLC (used for level calculation)
-        timeframe: "daily" | "monthly" | "yearly"
-        previous:  Yesterday's OHLC (needed for Insider condition check)
-    """
-    H, L, C = current.high, current.low, current.close
-    HL = H - L
+        current_hl_range = h3 - l3
 
-    # ── Resistance levels ─────────────────────────────────────────────────────
-    H3 = C + (HL * 0.275)
-    H4 = C + (HL * 0.55)
-    H5 = H4 + 1.168 * (H4 - H3)
-    H6 = (H / L) * C
+        return {
+            "H3": round(h3, 2),
+            "H4": round(h4, 2),
+            "H5": round(h5, 2),
+            "H6": round(h6, 2),
+            "L3": round(l3, 2),
+            "L4": round(l4, 2),
+            "L5": round(l5, 2),
+            "L6": round(l6, 2),
+            "PivotMid":    round(pivot_mid, 2),
+            "PivotBottom": round(pivot_bottom, 2),
+            "PivotTop":    round(pivot_top, 2),
+            "RangeWidth":  round(range_width, 6),
+            "NRD":         nrd,
+            "Insider":     insider,
+            "Signal":      nrd,   # Signal = NRD for now; Insider requires prev data
+            "HL_Range":    round(current_hl_range, 2),
+        }
 
-    # ── Support levels ────────────────────────────────────────────────────────
-    L3 = C - (HL * 0.275)
-    L4 = C - (HL * 0.55)
-    L5 = L4 - 1.168 * (L3 - L4)
-    L6 = C - (H6 - C)
-
-    # ── Pivot Range ───────────────────────────────────────────────────────────
-    pivot_middle = (H + L + C) / 3
-    pivot_bottom = (H + L) / 2
-    pivot_top    = (pivot_middle - pivot_bottom) + pivot_middle
-    range_width  = pivot_top - pivot_bottom
-
-    # ── Narrow Range Definition (NRD) ─────────────────────────────────────────
-    # TWO conditions must BOTH be true (Neelam's validation):
-    # 1. Range Width must be POSITIVE: close above session midpoint (bullish compression)
-    #    Negative range_width = close in lower half of candle = weak close = NOT a valid NRD
-    # 2. Range Width must be < 0.4% of Close (tight, compressed range)
-    is_nrd = (range_width > 0) and (range_width < (NRD_THRESHOLD * C))
-
-    # ── Insider Trading Level condition ───────────────────────────────────────
-    # Requires previous period's levels for comparison
-    is_insider = False
-    if previous is not None:
-        prev = calculate_levels(symbol, previous, timeframe, previous=None)
-        # Today's H levels must all be BELOW yesterday's H levels
-        h_condition = (H3 < prev.H3 and H4 < prev.H4 and
-                       H5 < prev.H5 and H6 < prev.H6)
-        # Today's L levels must all be ABOVE yesterday's L levels
-        l_condition = (L3 > prev.L3 and L4 > prev.L4 and
-                       L5 > prev.L5 and L6 > prev.L6)
-        is_insider = h_condition and l_condition
-
-    # ── Final signal ──────────────────────────────────────────────────────────
-    signal = is_nrd and is_insider
-    signal_type = "BOTH" if signal else None
-
-    return TradingLevels(
-        symbol=symbol,
-        timeframe=timeframe,
-        H3=round(H3, 2), H4=round(H4, 2),
-        H5=round(H5, 2), H6=round(H6, 2),
-        L3=round(L3, 2), L4=round(L4, 2),
-        L5=round(L5, 2), L6=round(L6, 2),
-        pivot_middle=round(pivot_middle, 2),
-        pivot_bottom=round(pivot_bottom, 2),
-        pivot_top=round(pivot_top, 2),
-        range_width=round(range_width, 2),
-        is_nrd=is_nrd,
-        is_insider=is_insider,
-        signal=signal,
-        signal_type=signal_type,
-    )
-
-
-def levels_to_dict(lv: TradingLevels) -> dict:
-    """Convert TradingLevels to a flat dict for writing to Google Sheets."""
-    return {
-        "Symbol":       lv.symbol,
-        "Timeframe":    lv.timeframe,
-        "H3": lv.H3, "H4": lv.H4, "H5": lv.H5, "H6": lv.H6,
-        "L3": lv.L3, "L4": lv.L4, "L5": lv.L5, "L6": lv.L6,
-        "Pivot Middle": lv.pivot_middle,
-        "Pivot Bottom": lv.pivot_bottom,
-        "Pivot Top":    lv.pivot_top,
-        "Range Width":  lv.range_width,
-        "NRD":          "YES" if lv.is_nrd else "NO",
-        "Insider":      "YES" if lv.is_insider else "NO",
-        "Signal":       "YES" if lv.signal else "NO",
-        "Signal Type":  lv.signal_type or "-",
-        "GTT Buy at":   lv.H6,   # GTT Buy CNC at H6
-        "GTT Sell at":  lv.L6,   # GTT Sell MIS at L6
-    }
+    def check_insider(
+        self,
+        current_h3: float, current_l3: float,
+        prev_h3: float, prev_l3: float,
+    ) -> bool:
+        """
+        Insider condition: today's H3-L3 range is TIGHTER than yesterday's.
+        Indicates price compression / insider accumulation.
+        """
+        current_range = current_h3 - current_l3
+        prev_range    = prev_h3    - prev_l3
+        return current_range < prev_range
