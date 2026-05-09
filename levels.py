@@ -1,32 +1,22 @@
 """
-levels.py — Core strategy calculations (v3 NRD fix retained).
+levels.py — Core strategy calculations.
 
-Formulas from Trading_Strategy.docx / API_Doc.docx:
+Formulas from Trading_Strategy.docx / API_Doc.docx (UNCHANGED):
   H3 = Close + (High - Low) * 0.275
   H4 = Close + (High - Low) * 0.55
   H5 = H4 + 1.168 * (H4 - H3)
-  H6 = (High / Low) * Close
-
+  H6 = (High / Low) * Close          ← GTT BUY trigger (CNC)
   L3 = Close - (High - Low) * 0.275
   L4 = Close - (High - Low) * 0.55
   L5 = L4 - 1.168 * (L3 - L4)
-  L6 = Close - (H6 - Close)
+  L6 = Close - (H6 - Close)          ← GTT SELL trigger (MIS)
 
-Pivot Range:
-  Middle = (High + Low + Close) / 3
-  Bottom = Middle - (High - Low)
-  Top    = Middle + (High - Low)
+Signal conditions (BOTH must be true):
+  1. NRD  — range_width > 0 AND range_width < 0.4% of Close
+  2. Insider — today's H3-L3 range < yesterday's H3-L3 range (compression)
 
-NRD (Narrow Range Day):
-  range_width = (2*Close - High - Low) / 3
-  NRD = range_width > 0 AND range_width < 0.4% of Close
-  (Must be positive — negative range_width means bearish close, not a valid NRD)
-
-Insider Trading Level:
-  Today's (H3–L3) range < Yesterday's (H3–L3) range
-  → price is compressing = insider accumulation
-
-Signal = NRD AND Insider both True
+FIX: Previously "Signal": nrd — insider check was bypassed.
+     Now Signal = nrd AND insider (correct original logic).
 """
 
 import logging
@@ -36,40 +26,60 @@ logger = logging.getLogger(__name__)
 
 class TradingLevels:
 
-    def calculate(self, high: float, low: float, close: float) -> dict:
+    def calculate(
+        self,
+        high: float,
+        low: float,
+        close: float,
+        prev_high: float | None = None,
+        prev_low: float | None = None,
+        prev_close: float | None = None,
+    ) -> dict:
         """
         Calculate all levels for a single candle.
-        Returns dict with H3-H6, L3-L6, pivot levels, NRD flag,
-        Insider flag (requires prev_high/prev_low), and Signal.
-        """
-        rng = high - low  # candle range
 
-        # ── Resistance levels ──
+        Pass prev_high / prev_low / prev_close to enable the Insider condition.
+        Without previous data, Insider = False, Signal = False.
+        """
+        rng = high - low
+
+        # ── Resistance levels (original formulas, unchanged) ──────────────────
         h3 = close + rng * 0.275
         h4 = close + rng * 0.55
         h5 = h4 + 1.168 * (h4 - h3)
         h6 = (high / low) * close if low != 0 else 0.0
 
-        # ── Support levels ──
+        # ── Support levels (original formulas, unchanged) ─────────────────────
         l3 = close - rng * 0.275
         l4 = close - rng * 0.55
         l5 = l4 - 1.168 * (l3 - l4)
         l6 = close - (h6 - close)
 
-        # ── Pivot Range ──
+        # ── Pivot Range ───────────────────────────────────────────────────────
         pivot_mid    = (high + low + close) / 3
         pivot_bottom = pivot_mid - rng
         pivot_top    = pivot_mid + rng
 
-        # ── NRD check ──
+        # ── NRD — range_width must be POSITIVE and < 0.4% of Close ───────────
+        # range_width = (2*Close - High - Low) / 3
+        # Positive means close is in upper half of candle (bullish compression)
         range_width = (2 * close - high - low) / 3
         nrd = (range_width > 0) and (range_width < 0.004 * close)
 
-        # ── Insider condition (requires prev candle — injected externally) ──
-        # This flag is set by the caller when it has yesterday's H3/L3.
-        insider = False  # default; set True by caller if prev range > current range
+        # ── Insider condition ─────────────────────────────────────────────────
+        # Today's H3-L3 range must be SMALLER than previous period's H3-L3 range
+        # = price is compressing = institutional accumulation
+        insider = False
+        if prev_high is not None and prev_low is not None and prev_close is not None:
+            prev_rng   = prev_high - prev_low
+            prev_h3    = prev_close + prev_rng * 0.275
+            prev_l3    = prev_close - prev_rng * 0.275
+            curr_range = h3 - l3          # today's H3-L3 width
+            prev_range = prev_h3 - prev_l3  # previous period's H3-L3 width
+            insider    = curr_range < prev_range
 
-        current_hl_range = h3 - l3
+        # ── Signal = NRD AND Insider ──────────────────────────────────────────
+        signal = nrd and insider
 
         return {
             "H3": round(h3, 2),
@@ -86,19 +96,6 @@ class TradingLevels:
             "RangeWidth":  round(range_width, 6),
             "NRD":         nrd,
             "Insider":     insider,
-            "Signal":      nrd,   # Signal = NRD for now; Insider requires prev data
-            "HL_Range":    round(current_hl_range, 2),
+            "Signal":      signal,
+            "HL_Range":    round(h3 - l3, 2),
         }
-
-    def check_insider(
-        self,
-        current_h3: float, current_l3: float,
-        prev_h3: float, prev_l3: float,
-    ) -> bool:
-        """
-        Insider condition: today's H3-L3 range is TIGHTER than yesterday's.
-        Indicates price compression / insider accumulation.
-        """
-        current_range = current_h3 - current_l3
-        prev_range    = prev_h3    - prev_l3
-        return current_range < prev_range
