@@ -1,33 +1,28 @@
 /**
- * webhook_worker.js — Cloudflare Worker (v2)
+ * webhook_worker.js — Cloudflare Worker (v3)
  *
- * User management via Google Sheets "Users" tab.
- * No hardcoded IDs. No secret editing. No redeploys.
+ * TWO modes:
+ *   1. fetch()     — handles Telegram webhook messages (/scan, /help, etc.)
+ *   2. scheduled() — Cloudflare Cron Trigger fires exactly at 9:15 AM IST
+ *                    and triggers GitHub Actions via repository_dispatch
  *
- * To add a user: Add their ChatID to the Users tab in Google Sheet → done.
- * To remove:     Delete their row → done.
+ * Why this fixes the timing:
+ *   GitHub scheduled cron jobs are delayed 2-3 hours during peak times.
+ *   Cloudflare Cron Triggers fire within seconds of the scheduled time.
+ *   repository_dispatch (used here) runs GitHub Actions immediately — no queue.
  *
- * Google Sheet "Users" tab columns:
- *   ChatID | Name | Status | Added On
- *   (Status: ACTIVE or BLOCKED)
- *
- * The tab must be published as CSV:
- *   Sheet → File → Share → Publish to web → Users tab → CSV format → Publish
- *   Copy the CSV URL → set as USERS_CSV_URL env var in Cloudflare Worker
- *
- * Cloudflare Worker env vars (set in dashboard):
- *   TELEGRAM_BOT_TOKEN  — bot token
- *   GITHUB_TOKEN        — GitHub PAT (repo scope)
- *   GITHUB_REPO         — "Saurabh-7973/algo-trader"
- *   ADMIN_CHAT_ID       — Saurabh's chat ID (gets registration notifications)
- *   USERS_CSV_URL       — published CSV URL of the Users tab
+ * Setup:
+ *   In Cloudflare Dashboard → Workers → your worker → Settings → Triggers
+ *   → Add Cron Trigger: "45 3 * * 1-5"  (3:45 AM UTC = 9:15 AM IST, Mon-Fri)
  */
 
-const CACHE_TTL_MS = 5 * 60 * 1000; // cache users list for 5 min
+const CACHE_TTL_MS = 5 * 60 * 1000;
 let usersCache = null;
 let cacheTime  = 0;
 
 export default {
+
+  // ── Telegram webhook handler ───────────────────────────────────────────────
   async fetch(request, env) {
     if (request.method !== "POST") {
       return new Response("Algo Trader Bot — Online", { status: 200 });
@@ -46,105 +41,85 @@ export default {
     const username  = message.from?.username
       ? `@${message.from.username}` : firstName || "Unknown";
 
-    const cmd = text.split(" ")[0].toLowerCase().replace("@", "").split("@")[0];
+    const cmd = text.split(" ")[0].toLowerCase().split("@")[0];
 
-    // ── Admin commands (no auth check needed) ─────────────────────
+    // Admin commands
     if (chatId === String(env.ADMIN_CHAT_ID)) {
       if (cmd === "/approve") {
         const targetId = text.split(" ")[1];
-        if (!targetId) {
-          await send(env, chatId, "Usage: /approve &lt;chatId&gt;");
-        } else {
-          await send(env, chatId,
-            `✅ To approve user <code>${targetId}</code>:\n\n` +
-            `1. Open your Google Sheet → Users tab\n` +
-            `2. Add a new row:\n` +
-            `   ChatID: <code>${targetId}</code>\n` +
-            `   Status: <code>ACTIVE</code>\n\n` +
-            `Access will work within 5 minutes.`
-          );
-        }
+        await send(env, chatId, targetId
+          ? `To approve ${targetId}:\nAdd to Users tab → ChatID: ${targetId} | Status: ACTIVE`
+          : "Usage: /approve <chatId>"
+        );
         return new Response("OK", { status: 200 });
       }
-
       if (cmd === "/users") {
-        const users = await getUsers(env, true); // force refresh
-        if (!users.length) {
-          await send(env, chatId, "No users in the Users tab yet.");
-        } else {
-          const lines = users.map((u, i) =>
-            `${i+1}. <code>${u.chatId}</code> — ${u.name} [${u.status}]`
-          ).join("\n");
-          await send(env, chatId, `<b>Active Users (${users.length})</b>\n\n${lines}`);
-        }
+        const users = await getUsers(env, true);
+        const lines = users.length
+          ? users.map((u,i) => `${i+1}. ${u.chatId} — ${u.name} [${u.status}]`).join("\n")
+          : "No active users.";
+        await send(env, chatId, `Active Users (${users.length})\n\n${lines}`);
         return new Response("OK", { status: 200 });
       }
     }
 
-    // ── Auth check for all other commands ─────────────────────────
-    const users  = await getUsers(env);
-    const user   = users.find(u => u.chatId === chatId);
-    const status = user?.status?.toUpperCase();
+    // Auth check
+    const users = await getUsers(env);
+    const user  = users.find(u => u.chatId === chatId);
 
-    if (!user || status === "BLOCKED") {
+    if (!user || user.status?.toUpperCase() === "BLOCKED") {
       if (!user) {
-        // Unknown user — notify admin
         await send(env, String(env.ADMIN_CHAT_ID),
-          `🔔 <b>New access request</b>\n\n` +
-          `Name: ${username}\n` +
-          `ChatID: <code>${chatId}</code>\n\n` +
-          `To approve, add to Users tab:\n` +
-          `ChatID: <code>${chatId}</code> · Status: <code>ACTIVE</code>\n\n` +
-          `Or reply: /approve ${chatId}`
+          `New access request\nName: ${username}\nChatID: ${chatId}\nAdd to Users tab with Status: ACTIVE`
         );
       }
       await send(env, chatId,
-        `⛔ <b>Access not yet granted.</b>\n\n` +
-        `Your request has been sent to the admin.\n` +
-        `You'll be able to use the bot once approved.\n\n` +
-        `Your Chat ID: <code>${chatId}</code>`
+        `Access not yet granted.\nRequest sent to admin.\nYour Chat ID: ${chatId}`
       );
       return new Response("OK", { status: 200 });
     }
 
-    // ── Commands ──────────────────────────────────────────────────
+    // Commands
     if (cmd === "/start" || cmd === "/help") {
       await send(env, chatId,
-        `👋 Welcome, ${firstName}!\n\n` +
-        `<b>Available Commands</b>\n\n` +
-        `/scan — Run full Nifty scan now\n` +
+        `Welcome, ${firstName}!\n\n` +
+        `/scan — Run scan now\n` +
         `/status — System status\n` +
         `/help — This message\n\n` +
-        `<i>Auto-scan runs every trading day at 9:15 AM IST.</i>`
+        `Auto-scan runs every trading day at 9:15 AM IST.`
       );
     }
-
     else if (cmd === "/scan") {
-      await send(env, chatId,
-        `🔍 <b>Scan triggered</b>\n\n` +
-        `Running full scan...\n` +
-        `Results in ~3 minutes.`
-      );
-      await triggerScan(env, chatId);
+      await send(env, chatId, `Scan triggered. Results in ~3 minutes.`);
+      await triggerGitHub(env, chatId, "scan");
     }
-
     else if (cmd === "/status") {
       await send(env, chatId,
-        `✅ <b>System Status</b>\n\n` +
-        `Bot: Online\nSchedule: 9:15 AM IST Mon–Fri\n` +
-        `Mode: Paper (signal only)\nBasket: Nifty 500`
+        `System Status\n\nBot: Online\nSchedule: 9:15 AM IST Mon-Fri\nMode: Paper`
       );
     }
-
     else {
-      await send(env, chatId, `Unknown command. Type /help for options.`);
+      await send(env, chatId, `Unknown command. Type /help`);
     }
 
     return new Response("OK", { status: 200 });
-  }
+  },
+
+  // ── Cloudflare Cron Trigger handler ───────────────────────────────────────
+  // Fires at exactly 3:45 AM UTC = 9:15 AM IST (set in Cloudflare dashboard)
+  // This bypasses GitHub's unreliable scheduled cron entirely.
+  async scheduled(event, env, ctx) {
+    console.log(`Cron fired: ${new Date().toISOString()}`);
+    try {
+      await triggerGitHub(env, "", "daily_scan");
+      console.log("Daily scan triggered via Cloudflare Cron");
+    } catch (e) {
+      console.error(`Cron trigger failed: ${e}`);
+    }
+  },
 };
 
-// ── Helpers ───────────────────────────────────────────────────────
+// ── Helpers ───────────────────────────────────────────────────────────────────
 
 async function getUsers(env, forceRefresh = false) {
   const now = Date.now();
@@ -154,7 +129,7 @@ async function getUsers(env, forceRefresh = false) {
   try {
     const resp = await fetch(env.USERS_CSV_URL);
     const csv  = await resp.text();
-    const rows = csv.trim().split("\n").slice(1); // skip header
+    const rows = csv.trim().split("\n").slice(1);
     usersCache = rows
       .map(row => {
         const cols = row.split(",").map(c => c.trim().replace(/^"|"$/g, ""));
@@ -170,19 +145,19 @@ async function getUsers(env, forceRefresh = false) {
 }
 
 async function send(env, chatId, text) {
+  if (!chatId) return;
   await fetch(`https://api.telegram.org/bot${env.TELEGRAM_BOT_TOKEN}/sendMessage`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ chat_id: chatId, text, parse_mode: "HTML" }),
+    body: JSON.stringify({ chat_id: chatId, text }),
   });
 }
 
-async function triggerScan(env, requestingChatId) {
+async function triggerGitHub(env, requestingChatId, eventType) {
   const [owner, repo] = (env.GITHUB_REPO || "").split("/");
-  const url = `https://api.github.com/repos/${owner}/${repo}/dispatches`;
-
-  try {
-    const response = await fetch(url, {
+  const response = await fetch(
+    `https://api.github.com/repos/${owner}/${repo}/dispatches`,
+    {
       method: "POST",
       headers: {
         "Authorization": `Bearer ${env.GITHUB_TOKEN}`,
@@ -191,22 +166,17 @@ async function triggerScan(env, requestingChatId) {
         "X-GitHub-Api-Version": "2022-11-28",
       },
       body: JSON.stringify({
-        event_type: "scan",
+        event_type: eventType,
         client_payload: { requesting_chat_id: requestingChatId },
       }),
-    });
-
-    if (!response.ok) {
-      const errorText = await response.text();
-      console.error(`GitHub dispatch failed: ${response.status} - ${errorText}`);
-      await send(env, requestingChatId,
-        `❌ Scan could not be started.\nGitHub returned: ${response.status}\nCheck logs for details.`
-      );
     }
-  } catch (error) {
-    console.error(`GitHub dispatch error: ${error}`);
-    await send(env, requestingChatId,
-      `❌ Scan failed to trigger.\nError: ${error.message}`
-    );
+  );
+
+  if (!response.ok) {
+    const err = await response.text();
+    console.error(`GitHub dispatch failed: ${response.status} — ${err}`);
+    if (requestingChatId) {
+      await send(env, requestingChatId, `Scan failed to start. GitHub error: ${response.status}`);
+    }
   }
 }
