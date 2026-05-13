@@ -1,5 +1,9 @@
 """
-sheets_manager.py — Google Sheets integration using gspread (v7).
+sheets_manager.py — Google Sheets integration using gspread.
+
+Fix: append_signals_batch now detects stale headers (old schema without Date
+column) and rewrites them before appending, so dates no longer appear under H3.
+
 All writes are batched (one API call) to avoid 429 quota errors.
 """
 
@@ -21,6 +25,17 @@ logger = logging.getLogger(__name__)
 SCOPES = [
     "https://www.googleapis.com/auth/spreadsheets",
     "https://www.googleapis.com/auth/drive",
+]
+
+# Expected column order for the Signals tab.
+# If the sheet's first row doesn't match this, it gets rewritten.
+SIGNAL_HEADERS = [
+    "Symbol", "Timeframe", "Date",
+    "H3", "H4", "H5", "H6",
+    "L3", "L4", "L5", "L6",
+    "NRD", "Insider", "Signal",
+    "GTT_Buy_H6", "GTT_Sell_L6",
+    "Timestamp",
 ]
 
 
@@ -50,7 +65,7 @@ def get_stock_basket() -> list[str]:
 
 def write_levels(levels_list: list[dict]) -> None:
     """
-    Overwrite Levels tab with all timeframe levels.
+    Overwrite Levels tab with today's calculated levels.
     One batch API call — avoids 429 quota.
     """
     if not levels_list:
@@ -67,27 +82,69 @@ def write_levels(levels_list: list[dict]) -> None:
 
 
 def append_signals_batch(signal_rows: list[dict]) -> None:
-    """Append all signal rows to Signals tab in one batch call."""
+    """
+    Append all signal rows to Signals tab in one batch call.
+
+    Header fix: if the existing first row doesn't match SIGNAL_HEADERS
+    (i.e. old schema without Date column), the sheet is cleared and
+    rewritten with correct headers before appending new data.
+    This prevents dates appearing under the H3 column.
+    """
     if not signal_rows:
         return
 
     ws = _open_sheet(SIGNALS_SHEET)
     ts = datetime.now().strftime("%Y-%m-%d %H:%M")
-    existing = ws.get_all_values()
+
+    existing     = ws.get_all_values()
+    current_hdrs = existing[0] if existing else []
+
+    # Detect header mismatch — old schema or empty
+    headers_ok = (current_hdrs == SIGNAL_HEADERS)
+
     rows_to_append = []
 
-    if not existing or not existing[0]:
-        rows_to_append.append(list(signal_rows[0].keys()) + ["Timestamp"])
+    if not headers_ok:
+        # Wipe stale headers and rewrite everything clean
+        logger.info("Signals tab headers are stale — clearing and rewriting with correct schema.")
+        ws.clear()
+        rows_to_append.append(SIGNAL_HEADERS)   # fresh correct headers
 
+    # Build data rows matching SIGNAL_HEADERS order exactly
     for row in signal_rows:
-        rows_to_append.append(list(row.values()) + [ts])
+        data_row = [
+            row.get("Symbol", ""),
+            row.get("Timeframe", ""),
+            row.get("Date", ""),
+            row.get("H3", ""),
+            row.get("H4", ""),
+            row.get("H5", ""),
+            row.get("H6", ""),
+            row.get("L3", ""),
+            row.get("L4", ""),
+            row.get("L5", ""),
+            row.get("L6", ""),
+            row.get("NRD", "NO"),
+            row.get("Insider", "NO"),
+            row.get("Signal", "NO"),
+            row.get("GTT_Buy_H6", ""),
+            row.get("GTT_Sell_L6", ""),
+            ts,
+        ]
+        rows_to_append.append(data_row)
 
     ws.append_rows(rows_to_append, value_input_option="USER_ENTERED")
     logger.info(f"Appended {len(signal_rows)} signal(s) to {SIGNALS_SHEET} tab.")
 
 
 def write_stored_levels(tab_name: str, levels_list: list[dict]) -> None:
-    """Write H5/H6/L5/L6 to Monthly or Yearly tab in one batch."""
+    """
+    Write H5/H6/L5/L6 to Monthly or Yearly tab in one batch.
+
+    When this runs:
+      Monthly tab → 1st of every month  (stores previous month's levels)
+      Yearly  tab → 1st of January      (stores previous year's levels)
+    """
     if not levels_list:
         return
 
