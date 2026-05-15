@@ -1,1 +1,76 @@
+# .github/workflows/trade_nse.yml
+# NSE Full Market Edition — runs on feature/nse-full-market branch
+#
+# IMPORTANT: This workflow only runs on the feature/nse-full-market branch.
+# The main branch workflow (trade.yml) is UNCHANGED.
+#
+# Triggers:
+#   1. Schedule: 3:45 AM UTC = 9:15 AM IST, Mon-Fri (backup — Cloudflare Cron is primary)
+#   2. Manual: Run workflow button in GitHub Actions UI
+#   3. On-demand: /scan from Telegram → Cloudflare Worker → repository_dispatch
 
+name: NSE Full Market Scan
+
+on:
+  schedule:
+    - cron: "45 3 * * 1-5"
+
+  workflow_dispatch:
+
+  repository_dispatch:
+    types: [scan]
+
+jobs:
+  run-algo:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30      # increased for 900+ stocks
+
+    # Only run on the new branch — main branch runs its own trade.yml
+    if: github.ref == 'refs/heads/feature/nse-full-market'
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          ref: feature/nse-full-market
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run NSE full market algo
+        env:
+          BROKER: ${{ secrets.BROKER }}
+
+          ANGEL_API_KEY:   ${{ secrets.ANGEL_API_KEY }}
+          ANGEL_CLIENT_ID: ${{ secrets.ANGEL_CLIENT_ID }}
+          ANGEL_PASSWORD:  ${{ secrets.ANGEL_PASSWORD }}
+          ANGEL_TOTP_KEY:  ${{ secrets.ANGEL_TOTP_KEY }}
+
+          ZERODHA_API_KEY:      ${{ secrets.ZERODHA_API_KEY }}
+          ZERODHA_API_SECRET:   ${{ secrets.ZERODHA_API_SECRET }}
+          ZERODHA_ACCESS_TOKEN: ${{ secrets.ZERODHA_ACCESS_TOKEN }}
+
+          GOOGLE_CREDENTIALS_JSON: ${{ secrets.GOOGLE_CREDENTIALS_JSON }}
+          SPREADSHEET_ID:          ${{ secrets.SPREADSHEET_ID }}
+
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID:   ${{ secrets.TELEGRAM_CHAT_ID }}
+          TELEGRAM_CHAT_IDS:  ${{ secrets.TELEGRAM_CHAT_IDS }}
+          USERS_CSV_URL:      ${{ secrets.USERS_CSV_URL }}
+
+          REQUESTING_CHAT_ID: ${{ github.event.client_payload.requesting_chat_id }}
+
+        run: python main.py
+
+      - name: Upload log on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: nse-run-log
+          path: "*.log"
+          retention-days: 7
