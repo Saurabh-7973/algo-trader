@@ -1,49 +1,72 @@
 """
-data_fetcher.py — Batch OHLC fetcher using yfinance.download()
+data_fetcher.py — NSE Full Market Edition (feature/nse-full-market branch)
 
-Returns BOTH current AND previous period for each timeframe.
-The 'previous' period is used for the Insider condition in levels.py.
+Key changes from main branch:
+  1. fetch_nse_symbols() — downloads all NSE equity symbols, filters price > min_price
+  2. fetch_daily_only() — fetches ONLY daily data (used on regular trading days)
+  3. fetch_monthly_data() — called ONLY on 1st of each month
+  4. fetch_yearly_data()  — called ONLY on 1st January
 
-Timeframe logic:
-  Daily   — current = last complete trading day (idx -1)
-             previous = day before that            (idx -2)
-             yfinance only returns actual NSE trading days — weekends,
-             Maharashtra Day, Diwali, all holidays automatically excluded.
-             No manual holiday calendar needed.
+Architecture:
+  Regular day  → fetch_daily_only() + read Sheets for monthly/yearly
+  1st of month → fetch_monthly_data() + store to Sheets
+  1st Jan      → fetch_yearly_data()  + store to Sheets
 
-  Monthly — current = last complete calendar month (idx -2)
-             previous = the month before that       (idx -3)
-             idx -1 = current month (in progress, incomplete)
-
-  Yearly  — current = last complete calendar year  (annual.iloc[-2])
-             previous = the year before that        (annual.iloc[-3])
+This makes regular days 3x faster than fetching all timeframes every day.
 """
 
+import csv
+import io
 import logging
 import time
 
 import pandas as pd
+import requests
 import yfinance as yf
 
 logger = logging.getLogger(__name__)
 
-BATCH_SIZE = 100
+BATCH_SIZE  = 100    # yfinance handles up to 100 tickers per call reliably
+BATCH_DELAY = 2.0    # seconds between batches
+NSE_EQUITY_URL = "https://archives.nseindia.com/content/equities/EQUITY_L.csv"
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
-def _ticker(symbol: str) -> str:
-    base = symbol.upper().replace(".NS", "").strip()
-    return f"{base}.NS"
+def _ns(symbol: str) -> str:
+    """Normalize to Yahoo Finance NSE format: RELIANCE → RELIANCE.NS"""
+    return symbol.upper().replace(".NS", "").strip() + ".NS"
 
 
-def _batches(items: list, size: int):
-    for i in range(0, len(items), size):
-        yield items[i:i + size]
+def _batches(lst: list, n: int = BATCH_SIZE):
+    for i in range(0, len(lst), n):
+        yield lst[i:i + n]
 
 
-def _extract_row(df: pd.DataFrame, ticker: str, pos: int) -> dict | None:
-    """Extract one row from a batch download result by position."""
+def _download(tickers: list[str], period: str, interval: str) -> pd.DataFrame | None:
+    """Batch download with one retry on failure."""
+    for attempt in range(2):
+        try:
+            df = yf.download(
+                tickers,
+                period=period,
+                interval=interval,
+                auto_adjust=True,
+                progress=False,
+                threads=True,
+            )
+            return None if df.empty else df
+        except Exception as e:
+            wait = (attempt + 1) * 5
+            logger.warning(f"Download error (attempt {attempt+1}): {e} — retrying in {wait}s")
+            time.sleep(wait)
+    return None
+
+
+def _extract(df: pd.DataFrame, ticker: str, pos: int) -> dict | None:
+    """Extract one OHLC row from a batch download result."""
+    if df is None or df.empty:
+        return None
     try:
         if isinstance(df.columns, pd.MultiIndex):
             h = df[("High",  ticker)]
@@ -55,192 +78,197 @@ def _extract_row(df: pd.DataFrame, ticker: str, pos: int) -> dict | None:
             sub = df[["High", "Low", "Close"]].copy()
 
         sub = sub.dropna()
-        if len(sub) < abs(pos) + (1 if pos < 0 else 0):
+        if len(sub) < abs(pos) + (0 if pos >= 0 else 1):
             return None
 
-        row  = sub.iloc[pos]
-        date = sub.index[pos if pos >= 0 else len(sub) + pos]
-
+        row = sub.iloc[pos]
+        date_idx = sub.index[pos if pos >= 0 else len(sub) + pos]
         return {
             "High":  round(float(row["High"]),  2),
             "Low":   round(float(row["Low"]),   2),
             "Close": round(float(row["Close"]), 2),
-            "Date":  date.strftime("%Y-%m-%d"),
+            "Date":  date_idx.strftime("%Y-%m-%d"),
         }
     except Exception as e:
-        logger.debug(f"_extract_row({ticker}, {pos}): {e}")
+        logger.debug(f"_extract({ticker}, {pos}): {e}")
         return None
 
 
-def _download(tickers: list[str], period: str, interval: str) -> pd.DataFrame | None:
-    """Single batch download with one retry on failure."""
-    for attempt in range(2):
-        try:
-            df = yf.download(
-                tickers,
-                period=period,
-                interval=interval,
-                auto_adjust=True,
-                progress=False,
-                threads=True,
-            )
-            return df if not df.empty else None
-        except Exception as e:
-            logger.warning(f"Download error (attempt {attempt+1}): {e}")
-            time.sleep(3)
-    return None
+def _extract_yearly(df: pd.DataFrame, ticker: str, pos: int) -> dict | None:
+    """Extract yearly OHLC via monthly→annual resample."""
+    try:
+        if isinstance(df.columns, pd.MultiIndex):
+            h = df[("High",  ticker)]
+            l = df[("Low",   ticker)]
+            c = df[("Close", ticker)]
+            sub = pd.concat([h, l, c], axis=1)
+            sub.columns = ["High", "Low", "Close"]
+        else:
+            sub = df[["High", "Low", "Close"]].copy()
+
+        sub = sub.dropna()
+        if sub.empty:
+            return None
+
+        annual = sub.resample("YE").agg({
+            "High":  "max",
+            "Low":   "min",
+            "Close": "last",
+        }).dropna()
+
+        needed = abs(pos) + (0 if pos >= 0 else 1)
+        if len(annual) < needed:
+            return None
+
+        row = annual.iloc[pos]
+        date_idx = annual.index[pos if pos >= 0 else len(annual) + pos]
+        return {
+            "High":  round(float(row["High"]),  2),
+            "Low":   round(float(row["Low"]),   2),
+            "Close": round(float(row["Close"]), 2),
+            "Date":  date_idx.strftime("%Y"),
+        }
+    except Exception as e:
+        logger.debug(f"_extract_yearly({ticker}, {pos}): {e}")
+        return None
+
+
+# ── NSE Full Market Symbol List ───────────────────────────────────────────────
+
+def fetch_nse_symbols(min_price: float = 100.0) -> list[str]:
+    """
+    Download all NSE-listed equity symbols and filter by minimum price.
+
+    Steps:
+      1. Download NSE's EQUITY_L.csv (all ~2000 listed stocks)
+      2. Filter Series=EQ (regular equity, not ETF/SME/debt)
+      3. Fetch current price in batches
+      4. Keep only stocks with Close > min_price
+
+    Returns list of symbols WITHOUT .NS suffix (e.g. ["RELIANCE", "TCS", ...])
+    """
+    # Step 1: Download NSE equity list
+    try:
+        resp = requests.get(NSE_EQUITY_URL, timeout=15,
+                            headers={"User-Agent": "Mozilla/5.0"})
+        resp.raise_for_status()
+        reader = csv.DictReader(io.StringIO(resp.text))
+        all_symbols = [
+            row["SYMBOL"].strip()
+            for row in reader
+            if row.get("SERIES", "").strip().upper() == "EQ"
+            and row.get("SYMBOL", "").strip()
+        ]
+        logger.info(f"NSE equity list: {len(all_symbols)} EQ series symbols")
+    except Exception as e:
+        logger.error(f"Failed to fetch NSE equity list: {e}")
+        logger.warning("Falling back to Basket tab for symbols")
+        return []
+
+    # Step 2: Filter by price using a quick batch price check
+    tickers = [_ns(s) for s in all_symbols]
+    valid = []
+
+    for batch_t, batch_s in zip(_batches(tickers), _batches(all_symbols)):
+        df = _download(batch_t, "2d", "1d")
+        if df is None:
+            continue
+        for ticker, sym in zip(batch_t, batch_s):
+            row = _extract(df, ticker, pos=-1)
+            if row and row["Close"] >= min_price:
+                valid.append(sym)
+        time.sleep(BATCH_DELAY)
+
+    logger.info(
+        f"After price filter (>{min_price}): {len(valid)} symbols out of {len(all_symbols)}"
+    )
+    return valid
 
 
 # ── Per-timeframe fetchers ────────────────────────────────────────────────────
 
-def fetch_daily(symbols: list[str]) -> dict[str, dict]:
+def fetch_daily_data(symbols: list[str]) -> dict[str, dict]:
     """
-    Returns {symbol: {"current": {...}, "previous": {...}}}
+    Fetch previous trading day HLC for all symbols (called every day).
 
-    current  = most recent complete trading day  (idx -1)
-    previous = the trading day before that       (idx -2)
+    current  = idx -1 = last complete trading day
+    previous = idx -2 = day before (for Insider condition comparison)
+
+    yfinance only returns actual NSE trading days — weekends and NSE
+    holidays (Maharashtra Day, Diwali, etc.) are automatically skipped.
+
+    Returns: {symbol: {"current": {...}, "previous": {...}}}
     """
     results = {}
-    tickers = [_ticker(s) for s in symbols]
+    tickers = [_ns(s) for s in symbols]
 
-    for batch in _batches(tickers, BATCH_SIZE):
-        logger.info(f"Daily fetch: {len(batch)} symbols")
-        df = _download(batch, "15d", "1d")
+    for batch_t, batch_s in zip(_batches(tickers), _batches(symbols)):
+        logger.info(f"Daily fetch: {len(batch_t)} symbols")
+        df = _download(batch_t, "15d", "1d")
         if df is None:
             continue
-        for ticker in batch:
-            sym = ticker.replace(".NS", "")
-            cur  = _extract_row(df, ticker, pos=-1)
-            prev = _extract_row(df, ticker, pos=-2)
+        for ticker, sym in zip(batch_t, batch_s):
+            cur  = _extract(df, ticker, pos=-1)
+            prev = _extract(df, ticker, pos=-2)
             if cur:
                 results[sym] = {"current": cur, "previous": prev}
-            else:
-                logger.warning(f"Daily data unavailable: {ticker}")
-        time.sleep(0.5)
+        time.sleep(BATCH_DELAY)
 
+    logger.info(f"Daily fetch complete: {len(results)}/{len(symbols)} stocks")
     return results
 
 
-def fetch_monthly(symbols: list[str]) -> dict[str, dict]:
+def fetch_monthly_data(symbols: list[str]) -> dict[str, dict]:
     """
-    Returns {symbol: {"current": {...}, "previous": {...}}}
+    Fetch previous month HLC (called ONLY on 1st of each month).
 
-    Fetches 6 months of monthly candles:
-      idx -1 = current month (incomplete — skip)
-      idx -2 = last complete month  ← current
-      idx -3 = month before that    ← previous (for insider check)
+    current  = idx -2 = last fully complete month
+    previous = idx -3 = month before that (for Insider comparison)
+
+    Returns: {symbol: {"current": {...}, "previous": {...}}}
     """
     results = {}
-    tickers = [_ticker(s) for s in symbols]
+    tickers = [_ns(s) for s in symbols]
 
-    for batch in _batches(tickers, BATCH_SIZE):
-        logger.info(f"Monthly fetch: {len(batch)} symbols")
-        df = _download(batch, "6mo", "1mo")
+    for batch_t, batch_s in zip(_batches(tickers), _batches(symbols)):
+        logger.info(f"Monthly fetch: {len(batch_t)} symbols")
+        df = _download(batch_t, "6mo", "1mo")
         if df is None:
             continue
-        for ticker in batch:
-            sym  = ticker.replace(".NS", "")
-            cur  = _extract_row(df, ticker, pos=-2)
-            prev = _extract_row(df, ticker, pos=-3)
+        for ticker, sym in zip(batch_t, batch_s):
+            cur  = _extract(df, ticker, pos=-2)
+            prev = _extract(df, ticker, pos=-3)
             if cur:
                 results[sym] = {"current": cur, "previous": prev}
-            else:
-                logger.warning(f"Monthly data unavailable: {ticker}")
-        time.sleep(0.5)
+        time.sleep(BATCH_DELAY)
 
+    logger.info(f"Monthly fetch complete: {len(results)}/{len(symbols)} stocks")
     return results
 
 
-def fetch_yearly(symbols: list[str]) -> dict[str, dict]:
+def fetch_yearly_data(symbols: list[str]) -> dict[str, dict]:
     """
-    Returns {symbol: {"current": {...}, "previous": {...}}}
+    Fetch previous year HLC (called ONLY on 1st January).
 
-    Fetches 40 months of monthly data, resamples to annual:
-      annual.iloc[-1] = current year (incomplete — skip)
-      annual.iloc[-2] = last complete year  ← current
-      annual.iloc[-3] = year before that    ← previous (for insider check)
+    current  = annual.iloc[-2] = last complete calendar year
+    previous = annual.iloc[-3] = year before that (for Insider comparison)
+
+    Returns: {symbol: {"current": {...}, "previous": {...}}}
     """
     results = {}
-    tickers = [_ticker(s) for s in symbols]
+    tickers = [_ns(s) for s in symbols]
 
-    for batch in _batches(tickers, BATCH_SIZE):
-        logger.info(f"Yearly fetch: {len(batch)} symbols")
-        df = _download(batch, "40mo", "1mo")
+    for batch_t, batch_s in zip(_batches(tickers), _batches(symbols)):
+        logger.info(f"Yearly fetch: {len(batch_t)} symbols")
+        df = _download(batch_t, "40mo", "1mo")
         if df is None:
             continue
+        for ticker, sym in zip(batch_t, batch_s):
+            cur  = _extract_yearly(df, ticker, pos=-2)
+            prev = _extract_yearly(df, ticker, pos=-3)
+            if cur:
+                results[sym] = {"current": cur, "previous": prev}
+        time.sleep(BATCH_DELAY)
 
-        for ticker in batch:
-            sym = ticker.replace(".NS", "")
-            try:
-                if isinstance(df.columns, pd.MultiIndex):
-                    h = df[("High",  ticker)]
-                    l = df[("Low",   ticker)]
-                    c = df[("Close", ticker)]
-                    sub = pd.concat([h, l, c], axis=1)
-                    sub.columns = ["High", "Low", "Close"]
-                else:
-                    sub = df[["High", "Low", "Close"]].copy()
-
-                sub = sub.dropna()
-                if sub.empty:
-                    continue
-
-                annual = sub.resample("YE").agg({
-                    "High":  "max",
-                    "Low":   "min",
-                    "Close": "last",
-                }).dropna()
-
-                if len(annual) < 3:
-                    # need at least 3 rows: [..., prev-year, curr-year, in-progress]
-                    logger.warning(f"Not enough yearly data for {ticker} (rows={len(annual)})")
-                    continue
-
-                def _row(idx):
-                    r = annual.iloc[idx]
-                    d = annual.index[idx if idx >= 0 else len(annual) + idx]
-                    return {
-                        "High":  round(float(r["High"]),  2),
-                        "Low":   round(float(r["Low"]),   2),
-                        "Close": round(float(r["Close"]), 2),
-                        "Date":  d.strftime("%Y"),
-                    }
-
-                results[sym] = {
-                    "current":  _row(-2),   # last complete year
-                    "previous": _row(-3),   # year before that
-                }
-
-            except Exception as e:
-                logger.warning(f"Yearly extract failed for {ticker}: {e}")
-
-        time.sleep(0.5)
-
+    logger.info(f"Yearly fetch complete: {len(results)}/{len(symbols)} stocks")
     return results
-
-
-# ── Unified entry point ───────────────────────────────────────────────────────
-
-def fetch_all_timeframes(symbols: list[str]) -> dict[str, dict]:
-    """
-    Fetch all three timeframes for a list of symbols.
-
-    Returns:
-    {
-        "daily": {
-            "RELIANCE": {
-                "current":  {"High": x, "Low": y, "Close": z, "Date": "2026-04-30"},
-                "previous": {"High": x, "Low": y, "Close": z, "Date": "2026-04-29"},
-            },
-            ...
-        },
-        "monthly": { ... },
-        "yearly":  { ... },
-    }
-    """
-    logger.info(f"Fetching all timeframes for {len(symbols)} symbols")
-    return {
-        "daily":   fetch_daily(symbols),
-        "monthly": fetch_monthly(symbols),
-        "yearly":  fetch_yearly(symbols),
-    }

@@ -1,19 +1,17 @@
 """
-alerts.py — Telegram alerts (v8)
+alerts.py — NSE Full Market Edition (feature/nse-full-market branch)
 
-Signal display strategy:
-  - One message per timeframe (3 messages max per run)
-  - Each signal on ONE line: Symbol | Buy@ | Sell@
-  - If >25 signals in a timeframe: show top 25, rest as count
-  - If still too long: split into multiple messages automatically
-  - Plain text only (no HTML) — zero parse errors, works on all Telegram clients
-  - Full signal list always available in Google Sheets (linked in message)
+Telegram format redesign:
+  - 2 columns only: Buy@H6 | Sell@L6 (H5/L5 removed from Telegram)
+  - Symbols right-aligned, prices right-aligned
+  - No line wrapping on any phone screen
+  - Top 25 per timeframe, +N more → Google Sheets
+  - H5/L5 still in Google Sheets Levels tab for analysis
 
-Why this format:
-  - Telegram monospace block makes columns readable
-  - One line per stock = scannable, easy to act on
-  - No scrolling through 144 entries — quality signals only (NRD + Insider)
-  - If still many signals, multiple messages are sent automatically
+Why H5/L5 removed from Telegram:
+  The only actionable GTT levels are H6 (buy) and L6 (sell).
+  H5/L5 are reference levels useful in Sheets — not for placing orders.
+  Removing them keeps every signal on ONE line even on small screens.
 """
 
 import csv
@@ -28,14 +26,14 @@ BOT_TOKEN     = os.getenv("TELEGRAM_BOT_TOKEN", "")
 USERS_CSV_URL = os.getenv("USERS_CSV_URL", "")
 CHAT_IDS_ENV  = os.getenv("TELEGRAM_CHAT_IDS", os.getenv("TELEGRAM_CHAT_ID", ""))
 
-MAX_LINES_PER_MSG = 25   # signals per Telegram message chunk
-MAX_CHARS         = 3800  # safe margin under Telegram's 4096 limit
+MAX_SIGNALS   = 25    # signals shown per timeframe before truncation
+MAX_CHARS     = 3800  # safe under Telegram's 4096 char limit
 
 
 # ── Recipients ────────────────────────────────────────────────────────────────
 
 def _get_chat_ids() -> list[str]:
-    """Load active chat IDs from Google Sheets CSV, fall back to env var."""
+    """Load active chat IDs from Users CSV, fall back to env var."""
     if USERS_CSV_URL:
         try:
             r = requests.get(USERS_CSV_URL, timeout=10)
@@ -50,8 +48,7 @@ def _get_chat_ids() -> list[str]:
             if ids:
                 return ids
         except Exception as e:
-            logger.warning(f"Could not load users CSV: {e}")
-
+            logger.warning(f"Users CSV load failed: {e}")
     return [c.strip() for c in CHAT_IDS_ENV.split(",") if c.strip()]
 
 
@@ -69,103 +66,108 @@ def _send(chat_id: str, text: str) -> bool:
         r.raise_for_status()
         return True
     except Exception as e:
-        logger.error(f"Send failed ({chat_id}): {e}")
+        logger.error(f"Telegram send failed ({chat_id}): {e}")
         return False
 
 
-def _send_to_all(text: str, recipients: list[str]) -> None:
+def _send_all(text: str, recipients: list[str]) -> None:
     for cid in recipients:
         _send(cid, text)
 
 
-def _split_and_send(text: str, recipients: list[str]) -> None:
-    """Auto-split long messages on newlines and send each chunk."""
+def _split_send(text: str, recipients: list[str]) -> None:
+    """Split long messages on newlines and send each chunk."""
     if len(text) <= MAX_CHARS:
-        _send_to_all(text, recipients)
+        _send_all(text, recipients)
         return
-
-    lines   = text.splitlines(keepends=True)
-    chunk   = ""
+    lines, chunk = text.splitlines(keepends=True), ""
     for line in lines:
         if len(chunk) + len(line) > MAX_CHARS:
             if chunk:
-                _send_to_all(chunk, recipients)
+                _send_all(chunk, recipients)
             chunk = line
         else:
             chunk += line
     if chunk:
-        _send_to_all(chunk, recipients)
+        _send_all(chunk, recipients)
 
 
 # ── Formatters ────────────────────────────────────────────────────────────────
 
-def _timeframe_block(label: str, tag: str, signals: list[dict], run_date: str) -> str:
+def _fmt_block(tag: str, label: str, signals: list[dict], date: str) -> str:
     """
-    Format one timeframe's signals as a compact plain-text table.
+    Format one timeframe block.
 
-    Example output:
-        [D] Daily TF — 30 Apr 2026
+    Example output (fits on any phone screen — 2 columns):
+        [D] Daily — 13 May 2026
         GTT Buy @ H6 (CNC)  |  GTT Sell @ L6 (MIS)
-        ──────────────────────────────────────────
-         #  Symbol        Buy@H6    Sell@L6   H5        L5
-        ──────────────────────────────────────────
-         1  RELIANCE     2980.35   2849.65  3012.40  2817.60
-         2  TCS          3418.20   3281.80  3450.10  3249.90
-        ──────────────────────────────────────────
-        2 signal(s) | Full list: Google Sheets > Signals tab
+        ─────────────────────────────────────
+         #  Symbol        Buy@H6    Sell@L6
+        ─────────────────────────────────────
+         1  AADHAR HFC    497.13    476.47
+         2  ABB          6490.22   6119.78
+        ...
+        +63 more — see Sheets > Signals tab
     """
     if not signals:
         return (
-            f"{tag} {label} — {run_date}\n"
-            f"No signals (NRD + Insider conditions not met)\n"
+            f"{tag} {label} — {date}\n"
+            f"No signals (NRD + Insider not met)\n"
         )
 
     total = len(signals)
-    shown = signals[:MAX_LINES_PER_MSG]
+    shown = signals[:MAX_SIGNALS]
 
-    header = (
-        f"{tag} {label} — {run_date}\n"
-        f"GTT Buy @ H6 (CNC)  |  GTT Sell @ L6 (MIS)\n"
-        f"{'─'*52}\n"
-        f"{'#':>2}  {'Symbol':<13} {'Buy@H6':>9} {'Sell@L6':>9} {'H5':>9} {'L5':>9}\n"
-        f"{'─'*52}\n"
-    )
+    lines = [
+        f"{tag} {label} — {date}",
+        f"GTT Buy @ H6 (CNC)  |  GTT Sell @ L6 (MIS)",
+        "─" * 43,
+        f"{'#':>2}  {'Symbol':<13} {'Buy@H6':>9} {'Sell@L6':>9}",
+        "─" * 43,
+    ]
 
-    rows = ""
     for i, sig in enumerate(shown, 1):
-        sym  = sig.get("Symbol", "")[:12]
-        h6   = sig.get("H6", 0)
-        l6   = sig.get("L6", 0)
-        h5   = sig.get("H5", 0)
-        l5   = sig.get("L5", 0)
-        rows += f"{i:>2}  {sym:<13} {h6:>9.2f} {l6:>9.2f} {h5:>9.2f} {l5:>9.2f}\n"
+        sym  = str(sig.get("Symbol", ""))[:12]
+        h6   = sig.get("GTT_Buy_H6")  or sig.get("H6",  0)
+        l6   = sig.get("GTT_Sell_L6") or sig.get("L6",  0)
+        try:
+            h6 = f"{float(h6):>9.2f}"
+            l6 = f"{float(l6):>9.2f}"
+        except (TypeError, ValueError):
+            h6 = f"{'?':>9}"
+            l6 = f"{'?':>9}"
+        lines.append(f"{i:>2}  {sym:<13} {h6} {l6}")
 
-    footer = f"{'─'*52}\n"
-    if total > MAX_LINES_PER_MSG:
-        footer += f"+{total - MAX_LINES_PER_MSG} more signals in Google Sheets > Signals tab\n"
+    lines.append("─" * 43)
+    if total > MAX_SIGNALS:
+        lines.append(f"+{total - MAX_SIGNALS} more — see Sheets > Signals tab")
     else:
-        footer += f"{total} signal(s) | Check Sheets > Signals tab for full details\n"
+        lines.append(f"{total} signal(s) — full details in Sheets > Signals tab")
 
-    return header + rows + footer
+    return "\n".join(lines)
 
 
 # ── Public API ────────────────────────────────────────────────────────────────
 
 def broadcast(
-    daily_signals:   list[dict] | None = None,
-    monthly_signals: list[dict] | None = None,
-    yearly_signals:  list[dict] | None = None,
-    run_date:        str = "",
+    daily_signals:      list[dict] | None = None,
+    monthly_signals:    list[dict] | None = None,
+    yearly_signals:     list[dict] | None = None,
+    run_date:           str = "",
     requesting_chat_id: str = "",
-    message:         str | None = None,
+    message:            str | None = None,
 ) -> None:
     """
     Send scan results to all active users.
 
-    Three separate messages (one per timeframe) to stay under
-    Telegram's 4096 character limit.
+    Sends 4 messages per run:
+      1. Summary header (counts)
+      2. Daily timeframe block
+      3. Monthly timeframe block
+      4. Yearly timeframe block
 
-    If `message` is a plain string (e.g. error/warning), sends it directly.
+    Each block auto-chunked if > 3800 chars.
+    Plain text only — no HTML/Markdown parse errors.
     """
     chat_ids   = _get_chat_ids()
     recipients = list(chat_ids)
@@ -173,12 +175,12 @@ def broadcast(
         recipients.append(requesting_chat_id)
 
     if not recipients:
-        logger.warning("No Telegram recipients — alert skipped.")
+        logger.warning("No Telegram recipients — skipping alert.")
         return
 
-    # Plain string (errors / warnings)
+    # Plain string message (errors / warnings)
     if message is not None:
-        _split_and_send(str(message), recipients)
+        _split_send(str(message), recipients)
         return
 
     daily   = daily_signals   or []
@@ -186,40 +188,38 @@ def broadcast(
     yearly  = yearly_signals  or []
     total   = len(daily) + len(monthly) + len(yearly)
 
-    # ── Summary header (always sent first) ───────────────────────────────────
+    # ── 1. Summary header ─────────────────────────────────────────────────────
     if total == 0:
-        header = (
+        _send_all(
             f"Algo Scan | {run_date}\n"
             f"No signals today.\n"
-            f"NRD + Insider conditions not met on any stock.\n"
-            f"(Daily | Monthly | Yearly — all checked)"
+            f"NRD + Insider not met on any stock (Daily, Monthly, Yearly).",
+            recipients,
         )
-        _send_to_all(header, recipients)
         return
 
-    header = (
+    _send_all(
         f"Algo Scan | {run_date}\n"
-        f"Total: {total} signal(s) "
-        f"[D:{len(daily)} M:{len(monthly)} Y:{len(yearly)}]\n"
-        f"Signals below need both NRD + Insider conditions."
-    )
-    _send_to_all(header, recipients)
-
-    # ── Daily TF ─────────────────────────────────────────────────────────────
-    _split_and_send(
-        _timeframe_block("[D]", "[D]", daily, run_date),
+        f"Total: {total} signal(s) [D:{len(daily)} M:{len(monthly)} Y:{len(yearly)}]\n"
+        f"Both NRD + Insider conditions required.",
         recipients,
     )
 
-    # ── Monthly TF ───────────────────────────────────────────────────────────
-    _split_and_send(
-        _timeframe_block("[M]", "[M]", monthly, run_date),
+    # ── 2. Daily block ────────────────────────────────────────────────────────
+    _split_send(
+        _fmt_block("[D]", "Daily TF (Prev Trading Day)", daily, run_date),
         recipients,
     )
 
-    # ── Yearly TF ────────────────────────────────────────────────────────────
-    _split_and_send(
-        _timeframe_block("[Y]", "[Y]", yearly, run_date),
+    # ── 3. Monthly block ──────────────────────────────────────────────────────
+    _split_send(
+        _fmt_block("[M]", "Monthly TF (Prev Month)", monthly, run_date),
+        recipients,
+    )
+
+    # ── 4. Yearly block ───────────────────────────────────────────────────────
+    _split_send(
+        _fmt_block("[Y]", "Yearly TF (Prev Year)", yearly, run_date),
         recipients,
     )
 

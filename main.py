@@ -1,9 +1,24 @@
 """
-main.py — Daily algo trading orchestrator (v8.1)
+main.py — NSE Full Market Edition (feature/nse-full-market branch)
 
-Levels sheet column order (clean, predictable):
-  Symbol | Timeframe | Date | H3 | H4 | H5 | H6 | L3 | L4 | L5 | L6
-  | NRD | Insider | Signal | GTT_Buy_H6 | GTT_Sell_L6
+Architecture (key difference from main branch):
+  Regular day  → fetch daily only + READ stored monthly/yearly from Sheets
+  1st of month → fetch + calculate + STORE monthly levels to Sheets
+  1st Jan      → fetch + calculate + STORE yearly levels to Sheets
+
+This makes regular days 3x faster:
+  350 stocks (old) → 3 timeframes → ~5 min
+  900 stocks (new) → 1 timeframe + 2 Sheets reads → ~40 seconds
+
+Flow:
+  1. Load symbol list (NSE full market OR Basket tab, based on Settings)
+  2. If 1st of month → refresh Monthly stored levels
+  3. If 1st Jan      → refresh Yearly stored levels
+  4. Every day       → fetch fresh Daily data
+  5. Read Monthly + Yearly stored levels from Sheets
+  6. Calculate signals for all 3 timeframes
+  7. Write to Levels + Signals tabs
+  8. Broadcast Telegram
 """
 
 import logging
@@ -12,13 +27,22 @@ import sys
 from datetime import datetime
 
 from config import BROKER, TELEGRAM_BOT_TOKEN
-from data_fetcher import fetch_all_timeframes
+from data_fetcher import (
+    fetch_nse_symbols,
+    fetch_daily_data,
+    fetch_monthly_data,
+    fetch_yearly_data,
+)
 from levels import TradingLevels
 from sheets_manager import (
+    get_settings,
     get_stock_basket,
     write_levels,
     append_signals_batch,
-    write_stored_levels,
+    write_full_stored_levels,
+    read_stored_levels,
+    SETTING_MIN_PRICE,
+    SETTING_USE_NSE,
 )
 from alerts import broadcast
 from broker import place_gtt_orders
@@ -34,11 +58,12 @@ REQUESTING_CHAT_ID = os.getenv("REQUESTING_CHAT_ID", "")
 calc = TradingLevels()
 
 
+# ── Row builder ───────────────────────────────────────────────────────────────
+
 def _build_row(symbol: str, timeframe: str, current: dict, result: dict) -> dict:
     """
-    Explicit column order for Levels sheet.
-    Symbol | Timeframe | Date | H3 | H4 | H5 | H6 | L3 | L4 | L5 | L6
-    | NRD | Insider | Signal | GTT_Buy_H6 | GTT_Sell_L6
+    Explicit column order — same structure in Levels, Monthly, Yearly tabs.
+    Symbol | Timeframe | Date | H3-H6 | L3-L6 | NRD | Insider | Signal | GTT levels
     """
     return {
         "Symbol":      symbol,
@@ -60,18 +85,26 @@ def _build_row(symbol: str, timeframe: str, current: dict, result: dict) -> dict
     }
 
 
-def compute_levels(
+# ── Level computation ─────────────────────────────────────────────────────────
+
+def compute_from_fetched(
     symbols: list[str],
     hlc_data: dict[str, dict],
     timeframe_label: str,
 ) -> tuple[list[dict], list[dict]]:
-    levels_rows = []
+    """
+    Calculate levels from freshly fetched HLC data.
+    Used on: 1st of month (monthly), 1st Jan (yearly), every day (daily).
+
+    hlc_data: {symbol: {"current": {H,L,C,Date}, "previous": {H,L,C,Date}}}
+    Returns: (all_rows, signal_rows)
+    """
+    all_rows    = []
     signal_rows = []
 
     for symbol in symbols:
         data = hlc_data.get(symbol)
         if not data:
-            logger.warning(f"  {symbol}/{timeframe_label}: no data, skipping.")
             continue
 
         current  = data.get("current")
@@ -89,11 +122,11 @@ def compute_levels(
                 prev_close=previous["Close"] if previous else None,
             )
         except Exception as e:
-            logger.error(f"  {symbol}/{timeframe_label}: calc error — {e}")
+            logger.error(f"{symbol}/{timeframe_label}: calc error — {e}")
             continue
 
         row = _build_row(symbol, timeframe_label, current, result)
-        levels_rows.append(row)
+        all_rows.append(row)
 
         if result.get("Signal"):
             signal_rows.append(row)
@@ -102,80 +135,148 @@ def compute_levels(
                 f"H6={result.get('H6')} L6={result.get('L6')}"
             )
 
-    return levels_rows, signal_rows
+    return all_rows, signal_rows
 
+
+def compute_from_stored(stored_rows: list[dict], timeframe_label: str) -> list[dict]:
+    """
+    Read pre-computed signal rows from stored Monthly/Yearly Sheets data.
+    Returns only rows where Signal=YES — no recalculation needed.
+
+    Used on: regular days (not 1st of month/year).
+    """
+    signals = []
+    for r in stored_rows:
+        if str(r.get("Signal", "")).strip().upper() == "YES":
+            # Ensure Timeframe field is set correctly
+            r["Timeframe"] = timeframe_label
+            signals.append(r)
+    return signals
+
+
+# ── Main pipeline ─────────────────────────────────────────────────────────────
 
 def run():
     now = datetime.now()
     logger.info("=" * 60)
-    logger.info(f"Algo run started — {now.strftime('%Y-%m-%d %H:%M')} IST")
+    logger.info(f"NSE Full Market run — {now.strftime('%Y-%m-%d %H:%M')} IST")
     logger.info(f"Broker: {BROKER.upper()}")
     logger.info("=" * 60)
 
-    symbols = get_stock_basket()
+    is_first_of_month = now.day == 1
+    is_first_of_year  = now.month == 1 and now.day == 1
+
+    # ── 1. Load symbol universe ───────────────────────────────────────────────
+    settings  = get_settings()
+    min_price = float(settings.get(SETTING_MIN_PRICE, 100.0))
+    use_nse   = bool(settings.get(SETTING_USE_NSE, False))
+
+    if use_nse:
+        logger.info(f"Mode: NSE full market (price > ₹{min_price})")
+        symbols = fetch_nse_symbols(min_price=min_price)
+        if not symbols:
+            logger.warning("NSE list fetch failed — falling back to Basket tab")
+            symbols = get_stock_basket()
+    else:
+        logger.info("Mode: Basket tab")
+        symbols = get_stock_basket()
+
     if not symbols:
-        msg = "Basket is empty — no active stocks. Add stocks to Basket tab (Active=YES)."
+        msg = "No active stocks found. Add stocks to Basket tab or enable USE_NSE_LIST in Settings."
         logger.warning(msg)
         broadcast(message=msg, requesting_chat_id=REQUESTING_CHAT_ID)
         return
-    logger.info(f"Basket: {len(symbols)} active stocks")
 
-    logger.info("Fetching HLC for all timeframes ...")
-    all_hlc     = fetch_all_timeframes(symbols)
-    daily_hlc   = all_hlc["daily"]
-    monthly_hlc = all_hlc["monthly"]
-    yearly_hlc  = all_hlc["yearly"]
+    logger.info(f"Symbol universe: {len(symbols)} stocks")
 
+    # ── 2. Monthly refresh (1st of each month) ────────────────────────────────
+    monthly_all = []
+    monthly_signals = []
+
+    if is_first_of_month:
+        logger.info("1st of month — fetching and storing monthly levels ...")
+        monthly_hlc = fetch_monthly_data(symbols)
+        monthly_all, monthly_signals = compute_from_fetched(
+            symbols, monthly_hlc, "Monthly"
+        )
+        if monthly_all:
+            write_full_stored_levels("Monthly", monthly_all)
+            logger.info(
+                f"Monthly stored: {len(monthly_all)} rows, "
+                f"{len(monthly_signals)} signals"
+            )
+    else:
+        # Read pre-stored monthly results — no API call needed
+        logger.info("Regular day — reading stored Monthly levels from Sheets ...")
+        stored_monthly = read_stored_levels("Monthly")
+        monthly_signals = compute_from_stored(stored_monthly, "Monthly")
+        monthly_all     = stored_monthly  # include all rows for Levels tab
+        logger.info(
+            f"Monthly (stored): {len(monthly_all)} rows, "
+            f"{len(monthly_signals)} signals"
+        )
+
+    # ── 3. Yearly refresh (1st January) ───────────────────────────────────────
+    yearly_all = []
+    yearly_signals = []
+
+    if is_first_of_year:
+        logger.info("1st Jan — fetching and storing yearly levels ...")
+        yearly_hlc = fetch_yearly_data(symbols)
+        yearly_all, yearly_signals = compute_from_fetched(
+            symbols, yearly_hlc, "Yearly"
+        )
+        if yearly_all:
+            write_full_stored_levels("Yearly", yearly_all)
+            logger.info(
+                f"Yearly stored: {len(yearly_all)} rows, "
+                f"{len(yearly_signals)} signals"
+            )
+    else:
+        logger.info("Regular day — reading stored Yearly levels from Sheets ...")
+        stored_yearly = read_stored_levels("Yearly")
+        yearly_signals = compute_from_stored(stored_yearly, "Yearly")
+        yearly_all     = stored_yearly
+        logger.info(
+            f"Yearly (stored): {len(yearly_all)} rows, "
+            f"{len(yearly_signals)} signals"
+        )
+
+    # ── 4. Daily data (fetched EVERY day) ─────────────────────────────────────
+    logger.info(f"Fetching daily data for {len(symbols)} stocks ...")
+    daily_hlc = fetch_daily_data(symbols)
+    daily_all, daily_signals = compute_from_fetched(
+        symbols, daily_hlc, "Daily"
+    )
     logger.info(
-        f"Fetched — daily:{len(daily_hlc)} "
-        f"monthly:{len(monthly_hlc)} yearly:{len(yearly_hlc)}"
+        f"Daily: {len(daily_all)} rows, {len(daily_signals)} signals"
     )
 
-    daily_levels,   daily_signals   = compute_levels(symbols, daily_hlc,   "Daily")
-    monthly_levels, monthly_signals = compute_levels(symbols, monthly_hlc, "Monthly")
-    yearly_levels,  yearly_signals  = compute_levels(symbols, yearly_hlc,  "Yearly")
-
-    logger.info(
-        f"Signals — daily:{len(daily_signals)} "
-        f"monthly:{len(monthly_signals)} yearly:{len(yearly_signals)}"
-    )
-
-    all_levels  = daily_levels  + monthly_levels  + yearly_levels
+    # ── 5. Write all levels to Sheets ─────────────────────────────────────────
+    all_levels  = daily_all + list(monthly_all) + list(yearly_all)
     all_signals = daily_signals + monthly_signals + yearly_signals
 
-    if all_levels:
-        write_levels(all_levels)
+    if daily_all:  # Write only daily to Levels tab (fresh every day)
+        write_levels(daily_all)
     if all_signals:
         append_signals_batch(all_signals)
 
-    if now.day == 1 and monthly_levels:
-        write_stored_levels("Monthly", [
-            {"Symbol": r["Symbol"], "H5": r.get("H5"), "H6": r.get("H6"),
-             "L5": r.get("L5"), "L6": r.get("L6")}
-            for r in monthly_levels
-        ])
-
-    if now.month == 1 and now.day == 1 and yearly_levels:
-        write_stored_levels("Yearly", [
-            {"Symbol": r["Symbol"], "H5": r.get("H5"), "H6": r.get("H6"),
-             "L5": r.get("L5"), "L6": r.get("L6")}
-            for r in yearly_levels
-        ])
-
+    # ── 6. GTT orders ─────────────────────────────────────────────────────────
     if BROKER not in ("", "paper"):
         for sig in all_signals:
-            sym = sig["Symbol"]
-            h6  = sig.get("GTT_Buy_H6")
-            l6  = sig.get("GTT_Sell_L6")
-            if h6 and l6:
+            sym = sig.get("Symbol", "")
+            h6  = sig.get("GTT_Buy_H6") or sig.get("H6")
+            l6  = sig.get("GTT_Sell_L6") or sig.get("L6")
+            if sym and h6 and l6:
                 try:
-                    res = place_gtt_orders(symbol=sym, h6=h6, l6=l6, qty=1)
+                    res = place_gtt_orders(symbol=sym, h6=float(h6), l6=float(l6), qty=1)
                     logger.info(f"GTT {sym}: {res}")
                 except Exception as e:
                     logger.error(f"GTT failed {sym}: {e}")
     else:
         logger.info("BROKER=PAPER — GTT orders skipped")
 
+    # ── 7. Broadcast Telegram ─────────────────────────────────────────────────
     broadcast(
         daily_signals=daily_signals,
         monthly_signals=monthly_signals,
@@ -185,7 +286,10 @@ def run():
     )
 
     logger.info("=" * 60)
-    logger.info(f"Run complete. {len(symbols)} scanned. {len(all_signals)} signals.")
+    logger.info(
+        f"Run complete. {len(symbols)} stocks. "
+        f"Signals: D={len(daily_signals)} M={len(monthly_signals)} Y={len(yearly_signals)}"
+    )
     logger.info("=" * 60)
 
 

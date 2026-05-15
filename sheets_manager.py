@@ -1,10 +1,13 @@
 """
-sheets_manager.py — Google Sheets integration using gspread.
+sheets_manager.py — NSE Full Market Edition (feature/nse-full-market branch)
 
-Fix: append_signals_batch now detects stale headers (old schema without Date
-column) and rewrites them before appending, so dates no longer appear under H3.
+Key addition: read_stored_levels() and write_full_stored_levels()
+These store the FULL calculated signal rows (including NRD, Insider, Signal)
+so that on non-refresh days we don't need to re-fetch or re-calculate.
 
-All writes are batched (one API call) to avoid 429 quota errors.
+Monthly tab: full level rows calculated on 1st of each month
+Yearly tab:  full level rows calculated on 1st Jan each year
+Both tabs include Signal=YES/NO so the daily run just reads and reports.
 """
 
 import json
@@ -27,146 +30,179 @@ SCOPES = [
     "https://www.googleapis.com/auth/drive",
 ]
 
-# Expected column order for the Signals tab.
-# If the sheet's first row doesn't match this, it gets rewritten.
-SIGNAL_HEADERS = [
-    "Symbol", "Timeframe", "Date",
-    "H3", "H4", "H5", "H6",
-    "L3", "L4", "L5", "L6",
-    "NRD", "Insider", "Signal",
-    "GTT_Buy_H6", "GTT_Sell_L6",
-    "Timestamp",
-]
+# Settings tab keys
+SETTINGS_SHEET = "Settings"
+SETTING_MIN_PRICE  = "MIN_PRICE"     # float — minimum stock price filter
+SETTING_USE_NSE    = "USE_NSE_LIST"  # TRUE/FALSE — use NSE full list vs Basket tab
 
 
-def get_client() -> gspread.Client:
+# ── Auth ──────────────────────────────────────────────────────────────────────
+
+def _get_client() -> gspread.Client:
     creds_dict = json.loads(GOOGLE_CREDENTIALS_JSON)
     creds = Credentials.from_service_account_info(creds_dict, scopes=SCOPES)
     return gspread.authorize(creds)
 
 
-def _open_sheet(tab_name: str):
-    return get_client().open_by_key(SPREADSHEET_ID).worksheet(tab_name)
+def _sheet(tab: str):
+    return _get_client().open_by_key(SPREADSHEET_ID).worksheet(tab)
 
+
+# ── Settings ──────────────────────────────────────────────────────────────────
+
+def get_settings() -> dict:
+    """
+    Read Settings tab. Returns dict of {Key: Value}.
+    Defaults if tab doesn't exist:
+      MIN_PRICE    = 100.0
+      USE_NSE_LIST = False
+    """
+    defaults = {
+        SETTING_MIN_PRICE: 100.0,
+        SETTING_USE_NSE:   False,
+    }
+    try:
+        records = _sheet(SETTINGS_SHEET).get_all_records()
+        for r in records:
+            k = str(r.get("Key", "")).strip().upper()
+            v = str(r.get("Value", "")).strip()
+            if k == SETTING_MIN_PRICE:
+                try:
+                    defaults[SETTING_MIN_PRICE] = float(v)
+                except ValueError:
+                    pass
+            elif k == SETTING_USE_NSE:
+                defaults[SETTING_USE_NSE] = v.upper() in ("TRUE", "YES", "1")
+    except Exception as e:
+        logger.warning(f"Settings tab not found or error: {e} — using defaults")
+    return defaults
+
+
+# ── Basket ────────────────────────────────────────────────────────────────────
 
 def get_stock_basket() -> list[str]:
-    """Read Basket tab → return list of active stock symbols (no .NS suffix)."""
-    sheet = _open_sheet(BASKET_SHEET)
-    records = sheet.get_all_records()
+    """
+    Read Basket tab → return active symbols (no .NS suffix).
+    Active = YES / TRUE / Y / 1 (case-insensitive).
+    Blank rows skipped.
+    """
+    records = _sheet(BASKET_SHEET).get_all_records()
     symbols = [
         r["Symbol"].strip().upper().replace(".NS", "")
         for r in records
         if str(r.get("Active", "")).strip().upper() in ("YES", "TRUE", "Y", "1")
-        and r.get("Symbol", "").strip() != ""
+        and r.get("Symbol", "").strip()
     ]
-    logger.info(f"Loaded {len(symbols)} active stocks from basket")
+    logger.info(f"Basket: {len(symbols)} active stocks")
     return symbols
 
 
+# ── Levels sheet ──────────────────────────────────────────────────────────────
+
 def write_levels(levels_list: list[dict]) -> None:
     """
-    Overwrite Levels tab with today's calculated levels.
-    One batch API call — avoids 429 quota.
+    Overwrite Levels tab in one batch (avoids 429 quota).
+    Splits into chunks of 500 rows to stay under Google Sheets payload limit.
     """
     if not levels_list:
-        logger.warning("write_levels: nothing to write.")
         return
 
-    ws = _open_sheet(LEVELS_SHEET)
+    ws = _sheet(LEVELS_SHEET)
     ws.clear()
+
     ts = datetime.now().strftime("%Y-%m-%d %H:%M")
     headers = list(levels_list[0].keys()) + ["Timestamp"]
-    all_rows = [headers] + [list(row.values()) + [ts] for row in levels_list]
-    ws.append_rows(all_rows, value_input_option="USER_ENTERED")
-    logger.info(f"Wrote {len(levels_list)} rows to {LEVELS_SHEET} tab.")
+    all_rows = [headers]
+    for row in levels_list:
+        all_rows.append(list(row.values()) + [ts])
 
+    # Chunk to avoid payload size limit
+    CHUNK = 500
+    for i in range(0, len(all_rows), CHUNK):
+        ws.append_rows(all_rows[i:i + CHUNK], value_input_option="USER_ENTERED")
+
+    logger.info(f"Wrote {len(levels_list)} rows to Levels tab.")
+
+
+# ── Signals sheet ─────────────────────────────────────────────────────────────
 
 def append_signals_batch(signal_rows: list[dict]) -> None:
-    """
-    Append all signal rows to Signals tab in one batch call.
-
-    Header fix: if the existing first row doesn't match SIGNAL_HEADERS
-    (i.e. old schema without Date column), the sheet is cleared and
-    rewritten with correct headers before appending new data.
-    This prevents dates appearing under the H3 column.
-    """
+    """Append signal rows to Signals tab (never overwrites — cumulative log)."""
     if not signal_rows:
         return
 
-    ws = _open_sheet(SIGNALS_SHEET)
+    ws = _sheet(SIGNALS_SHEET)
     ts = datetime.now().strftime("%Y-%m-%d %H:%M")
+    existing = ws.get_all_values()
+    rows = []
 
-    existing     = ws.get_all_values()
-    current_hdrs = existing[0] if existing else []
+    if not existing or not existing[0]:
+        rows.append(list(signal_rows[0].keys()) + ["Timestamp"])
 
-    # Detect header mismatch — old schema or empty
-    headers_ok = (current_hdrs == SIGNAL_HEADERS)
-
-    rows_to_append = []
-
-    if not headers_ok:
-        # Wipe stale headers and rewrite everything clean
-        logger.info("Signals tab headers are stale — clearing and rewriting with correct schema.")
-        ws.clear()
-        rows_to_append.append(SIGNAL_HEADERS)   # fresh correct headers
-
-    # Build data rows matching SIGNAL_HEADERS order exactly
     for row in signal_rows:
-        data_row = [
-            row.get("Symbol", ""),
-            row.get("Timeframe", ""),
-            row.get("Date", ""),
-            row.get("H3", ""),
-            row.get("H4", ""),
-            row.get("H5", ""),
-            row.get("H6", ""),
-            row.get("L3", ""),
-            row.get("L4", ""),
-            row.get("L5", ""),
-            row.get("L6", ""),
-            row.get("NRD", "NO"),
-            row.get("Insider", "NO"),
-            row.get("Signal", "NO"),
-            row.get("GTT_Buy_H6", ""),
-            row.get("GTT_Sell_L6", ""),
-            ts,
-        ]
-        rows_to_append.append(data_row)
+        rows.append(list(row.values()) + [ts])
 
-    ws.append_rows(rows_to_append, value_input_option="USER_ENTERED")
-    logger.info(f"Appended {len(signal_rows)} signal(s) to {SIGNALS_SHEET} tab.")
+    ws.append_rows(rows, value_input_option="USER_ENTERED")
+    logger.info(f"Appended {len(signal_rows)} signal(s) to Signals tab.")
 
 
-def write_stored_levels(tab_name: str, levels_list: list[dict]) -> None:
+# ── Stored levels (Monthly / Yearly) ─────────────────────────────────────────
+
+# Full column set stored for monthly/yearly tabs
+_STORED_COLS = [
+    "Symbol", "Date",
+    "H3", "H4", "H5", "H6",
+    "L3", "L4", "L5", "L6",
+    "NRD", "Insider", "Signal",
+    "GTT_Buy_H6", "GTT_Sell_L6",
+    "Stored_On",
+]
+
+
+def write_full_stored_levels(tab_name: str, rows: list[dict]) -> None:
     """
-    Write H5/H6/L5/L6 to Monthly or Yearly tab in one batch.
+    Write full calculated level rows to Monthly or Yearly tab.
+    Called only on 1st of month (Monthly) or 1st Jan (Yearly).
 
-    When this runs:
-      Monthly tab → 1st of every month  (stores previous month's levels)
-      Yearly  tab → 1st of January      (stores previous year's levels)
+    Stores EVERYTHING including NRD, Insider, Signal so that on
+    non-refresh days we just read the pre-computed results.
     """
-    if not levels_list:
+    if not rows:
         return
 
-    ws = _open_sheet(tab_name)
+    ws = _sheet(tab_name)
     ws.clear()
+
     stored_on = datetime.now().strftime("%Y-%m-%d")
-    all_rows = [["Symbol", "H5", "H6", "L5", "L6", "Stored On"]]
-    for row in levels_list:
+    all_rows = [_STORED_COLS]
+    for r in rows:
         all_rows.append([
-            row.get("Symbol", ""),
-            row.get("H5", ""),
-            row.get("H6", ""),
-            row.get("L5", ""),
-            row.get("L6", ""),
+            r.get("Symbol", ""),
+            r.get("Date", ""),
+            r.get("H3", ""), r.get("H4", ""), r.get("H5", ""), r.get("H6", ""),
+            r.get("L3", ""), r.get("L4", ""), r.get("L5", ""), r.get("L6", ""),
+            r.get("NRD", "NO"),
+            r.get("Insider", "NO"),
+            r.get("Signal", "NO"),
+            r.get("GTT_Buy_H6", ""),
+            r.get("GTT_Sell_L6", ""),
             stored_on,
         ])
+
     ws.append_rows(all_rows, value_input_option="USER_ENTERED")
-    logger.info(f"Stored {len(levels_list)} rows to {tab_name} tab.")
+    logger.info(f"Stored {len(rows)} rows to {tab_name} tab.")
 
 
-def get_stored_levels(tab_name: str) -> dict[str, dict]:
-    """Read stored Monthly or Yearly levels. Returns dict keyed by symbol."""
-    ws = _open_sheet(tab_name)
-    records = ws.get_all_records()
-    return {r["Symbol"]: r for r in records}
+def read_stored_levels(tab_name: str) -> list[dict]:
+    """
+    Read stored level rows from Monthly or Yearly tab.
+    Returns list of dicts (one per symbol) — same format as compute output.
+    Returns empty list if tab is empty or doesn't exist.
+    """
+    try:
+        records = _sheet(tab_name).get_all_records()
+        logger.info(f"Read {len(records)} stored rows from {tab_name} tab.")
+        return records
+    except Exception as e:
+        logger.warning(f"Could not read {tab_name} tab: {e}")
+        return []
